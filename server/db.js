@@ -239,6 +239,44 @@ CREATE TABLE IF NOT EXISTS reservation_pending_actions (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rsv_pending_one ON reservation_pending_actions(reservation_id) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS idx_rsv_pending_status ON reservation_pending_actions(status);
 
+-- ========================================================================
+-- 设施停运统一补偿队列（可恢复的补偿处理 / Saga 补偿任务）
+--   停运后散客预约退款、团队行程重排/退款、联营退款红冲统一登记为本表任务：
+--   每个任务独立事务执行，系统失败不影响其他任务与停运主流程；
+--   引擎每小时（爽约/结案扫描之前）统一重试，成功才同步库存/现金/投诉/账单，
+--   任务按 idem_key 幂等去重，人工或其他途径先行处置后置 obsolete，重试绝不二次扣款/退款。
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS outage_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,                    -- reservation_refund 散客预约园方退款 / group_outage 团队行程重排或退款 / partner_refund 联营退款红冲
+  ref_type TEXT NOT NULL DEFAULT '',     -- 关联对象类型（reservation/group_item/vendor 等，仅展示）
+  ref_id INTEGER NOT NULL DEFAULT 0,     -- 关联对象 id
+  idem_key TEXT NOT NULL,                -- 幂等键：同一补偿意图唯一（部分唯一索引兜底并发）
+  payload TEXT NOT NULL DEFAULT '{}',    -- 任务参数快照（JSON：退款原因/备注/停运来源/金额等，重试用同口径）
+  status TEXT NOT NULL DEFAULT 'pending',-- pending 待补偿 / done 已补偿 / obsolete 对象已被他途处置
+  attempts INTEGER NOT NULL DEFAULT 0,  -- 已尝试次数
+  last_error TEXT NOT NULL DEFAULT '',   -- 最近一次失败错误码与信息（可追踪）
+  source TEXT NOT NULL DEFAULT 'outage', -- outage 停运批处理 / manual 人工 / emergency 应急封控
+  created_tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  updated_tick INTEGER NOT NULL DEFAULT 0,
+  done_tick INTEGER NOT NULL DEFAULT 0,
+  done_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outage_task_idem ON outage_tasks(idem_key) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_outage_task_status ON outage_tasks(status,kind);
+
+-- 补偿任务时间线：每次入队/尝试/成功/作废留痕，可追踪
+CREATE TABLE IF NOT EXISTS outage_task_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL DEFAULT 0,
+  day INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,                  -- enqueue/retry/done/observe
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_outage_task_logs_tid ON outage_task_logs(task_id);
+
 -- 设施检修工单：报修后进入排队，维修员工接单后按游戏时间推进，支持转派与离岗接续
 CREATE TABLE IF NOT EXISTS maintenance_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1084,6 +1122,7 @@ CREATE TABLE IF NOT EXISTS partner_sales (
   kind TEXT NOT NULL DEFAULT 'sale',       -- sale 销售 / return 退货红冲
   origin_sale_id INTEGER,                  -- 退货红冲关联原销售流水
   complaint_id INTEGER,                    -- 退货联动投诉（如有）
+  outage_task_id INTEGER,                  -- 停运补偿任务溯源：同一补偿任务重试不重复红冲/退款
   settlement_id INTEGER NOT NULL DEFAULT 0,
   day INTEGER NOT NULL DEFAULT 0,
   tick INTEGER NOT NULL DEFAULT 0,
@@ -1380,6 +1419,9 @@ ensureColumn('member_benefits', 'origin_member_id', "origin_member_id INTEGER") 
 // 供应商批次召回：批次隔离量（独立计量，不计入可售；退回供应商/销毁时才核减库存）与在途召回单
 ensureColumn('inbound_batches', 'quarantined_qty', "quarantined_qty REAL NOT NULL DEFAULT 0")
 ensureColumn('inbound_batches', 'recall_id', "recall_id INTEGER")
+// 停运统一补偿：联营退款红冲行溯源补偿任务（同任务重试不重复红冲/退款）
+ensureColumn('partner_sales', 'outage_task_id', "outage_task_id INTEGER")
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_psales_outage_task ON partner_sales(outage_task_id) WHERE kind='return' AND outage_task_id IS NOT NULL;`)
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -1400,22 +1442,27 @@ function tx(fn) {
   txDepth++
   const pending = afterCommitQueue
   afterCommitQueue = []
+  let result, cbs = []
+  let committed = false
   try {
-    const r = fn()
+    result = fn()
     db.exec('COMMIT')
-    const cbs = afterCommitQueue
-    afterCommitQueue = pending
-    // 提交成功后才触发联动；回调自身异常不影响已提交的业务结果
-    for (const cb of cbs) { try { cb() } catch (e) { console.error('[db] afterCommit 联动失败（事务已提交，不影响业务结果）:', e) } }
-    return r
+    committed = true
+    cbs = afterCommitQueue
   } catch (e) {
-    try { db.exec('ROLLBACK') } catch { /* 连接已回滚时忽略 */ }
+    // 业务函数抛错：连接仍在事务内，ROLLBACK 撤销全部写入；
+    // 极端情况下 COMMIT 自身抛错（连接已自动回滚），此处 ROLLBACK 报错被吞掉，不影响原错误上抛。
+    try { db.exec('ROLLBACK') } catch { /* 连接已提交/已回滚 */ }
     // 回滚：丢弃本事务登记的全部联动，绝不让未生效的库存/订单变化触发重排
-    afterCommitQueue = pending
     throw e
   } finally {
+    afterCommitQueue = pending
     txDepth--
   }
+  // 提交成功后才触发联动（此时事务深度已归零，回调内可独立开关事务，失败能自行回滚）；
+  // 回调自身异常不影响已提交的业务结果。
+  for (const cb of cbs) { try { cb() } catch (e) { console.error('[db] afterCommit 联动失败（事务已提交，不影响业务结果）:', e) } }
+  return result
 }
 
 const now = () => new Date().toISOString()

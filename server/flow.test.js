@@ -23,7 +23,7 @@ G.initGroupContext({
   logFinance: (day, label, amount, detail) => finLogs.push({ day, label, amount, detail }),
   createComplaint: () => ({ id: 2, code: 'TS0002' })
 })
-RSV.initReservationContext({ handleParkOutageGroup: (rows, info) => G.handleParkOutageGroupRows(rows, info) })
+RSV.initReservationContext({ planGroupOutageTasks: (rows, info) => G.planParkOutageGroupTasks(rows, info, 'outage') })
 SCH.initSchedulingContext({
   logFinance: (day, label, amount, detail) => finLogs.push({ day, label, amount, detail }),
   complaintRoles: { queue: ['保安', '安保'], hygiene: ['保洁'], facility: ['维修'] }

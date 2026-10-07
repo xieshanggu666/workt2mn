@@ -114,6 +114,7 @@ export const useParkStore = defineStore('park', {
     entrySlots: s => s.data?.entrySlots || [],
     reservations: s => s.data?.reservations || [],
     reservationStats: s => s.data?.reservationStats || emptyReservationStats(),
+    outageStats: s => s.data?.outageStats || { pending: 0, pendingByKind: { reservation: 0, group: 0, partner: 0 }, doneToday: 0 },
     openComplaints: s => (s.data?.complaints || []).filter(c => ['open', 'processing', 'ready'].includes(c.status)),
     activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active'),
     // 会员与权益
@@ -265,6 +266,10 @@ export const useParkStore = defineStore('park', {
     refundOutageItem(id, request_id) { return this.api('POST', `/group-items/${id}/refund-outage`, { request_id }) },
     saveGroupConfig(payload) { return this.api('POST', '/group-config', payload) },
     async groupDetail(id) { return j('GET', `/groups/${id}`) },
+    // 设施停运统一补偿中心
+    async outageTasks(status = 'pending', kind = '') { return j('GET', `/outage/tasks?status=${status}${kind ? `&kind=${kind}` : ''}`) },
+    async outageTaskLogs(id) { return j('GET', `/outage/tasks/${id}`) },
+    retryOutageTasks() { return this.api('POST', '/outage/retry', {}) },
     // 统一客流预测与资源调度闭环
     async closedLoop(horizon = 3) { return j('GET', `/closed-loop?horizon=${horizon}`) },
     runReconcile(autoHeal = true) { return this.api('POST', '/reconcile/run', { auto_heal: autoHeal }) },

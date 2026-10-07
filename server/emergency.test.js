@@ -12,6 +12,7 @@ const { default: db, getSetting, setSetting } = await import('./db.js')
 const RSV = await import('./reservations.js')
 const MAINT = await import('./maintenance.js')
 const EM = await import('./emergency.js')
+const OUTAGE = await import('./outage.js')
 
 // ---- 共享测试上下文：记录财务流水、投诉建单/关闭、排班在岗、调度触发 ----
 const finLogs = []
@@ -29,8 +30,7 @@ RSV.initReservationContext({
     const id = complaints.size + 1
     complaints.set(id, { id, status: 'open', ...p })
     return { id, code: 'TS' + String(id).padStart(4, '0') }
-  },
-  handleParkOutageGroup: () => {}
+  }
 })
 MAINT.initMaintenanceContext({
   logFinance: (...a) => finLogs.push(a[3] === undefined ? { label: a[1] } : { day: a[0], label: a[1], amount: a[2], detail: a[3] }),
@@ -251,34 +251,49 @@ test('幂等：同 request_id 重放不重复建单/封控/退款/赔付', () =>
   assert.equal(db.prepare('SELECT refund_amount FROM reservations WHERE id=?').get(b.id).refund_amount > 0, true)
 })
 
-test('封控事务原子回滚：退款流水中段失败 → 设施/时段/封控对象/事件状态全部回滚', () => {
+test('封控补偿可恢复：退款流水失败不阻断封控，补偿任务挂起且现金/库存不动，恢复后排空队列原子补退', () => {
   const s = rideSlot(6, 2, 13)
   const b = RSV.createReservation({ scope: 'ride', rideId: 6, slotId: s.id, qty: 2, requestId: 'roll-book' })
   assert.equal(b.ok, true)
-  const r = EM.reportIncident({ type: 'facility', title: '回滚用事件', reporterRole: 'operations', requestId: 'roll-rep' })
+  const r = EM.reportIncident({ type: 'facility', title: '补偿恢复用事件', reporterRole: 'operations', requestId: 'roll-rep' })
   const cash0 = cash()
 
+  // 封控事务（关时段/停运/登记补偿任务/投诉）先提交；补偿执行阶段退款流水持续失败
   failRefundFinance = true
   const g = EM.gradeIncident(r.id, {
     severity: 2, lockdown: { rides: [6], zones: [], autoZone: false }, requestId: 'roll-grade'
   })
+  // 手动多轮排空：补偿任务反复失败，保持 pending
+  let drain
+  for (let i = 0; i < 3; i++) drain = OUTAGE.drainPendingTasks({ kinds: ['reservation_refund'] })
   failRefundFinance = false
 
-  assert.equal(g.ok, false, '联动失败必须返回失败而非假成功')
-  assert.equal(rideById(6).status, 'operating', '设施停运应回滚')
-  assert.equal(rideSlot(6, 2, 13).status, 'open', '时段关停应回滚')
-  assert.equal(db.prepare('SELECT status FROM reservations WHERE id=?').get(b.id).status, 'booked', '预约退款应回滚')
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM incident_targets WHERE incident_id=?').get(r.id).n, 0, '封控对象应回滚')
-  assert.equal(incById(r.id).status, 'reported', '事件分级应回滚为待分级')
-  assert.equal(cash(), cash0, '现金不得变化')
+  // 封控主流程成功（隔离优先），但补偿未完成：设施停运、时段关闭已落库
+  assert.equal(g.ok, true, '退款执行失败不应回滚封控主流程')
+  assert.equal(rideById(6).status, 'closed', '设施应应急停运')
+  assert.equal(rideSlot(6, 2, 13).status, 'closed', '时段应关停')
+  assert.ok(db.prepare("SELECT id FROM incident_targets WHERE incident_id=? AND target_type='ride' AND target_id=6").get(r.id), '封控对象应已登记')
+  assert.equal(incById(r.id).status, 'contained', '事件应已分级封控')
+  // 资金/库存/预约三者保持一致：现金未退、名额未释放、预约仍待核销（不虚报）
+  assert.equal(db.prepare('SELECT status FROM reservations WHERE id=?').get(b.id).status, 'booked', '补偿未成功前预约保持待核销')
+  assert.equal(cash(), cash0, '现金不得减少')
+  assert.equal(rideSlot(6, 2, 13).refund_count, 0, 'refund_count 不得累加')
+  assert.equal(rideSlot(6, 2, 13).booked_count, 2, '名额不得释放')
+  assert.ok(drain.remaining >= 1, '补偿任务应保持 pending 等待重试')
 
-  // 恢复后重试成功
-  const retry = EM.gradeIncident(r.id, {
-    severity: 2, lockdown: { rides: [6], zones: [], autoZone: false }, requestId: 'roll-grade-retry'
-  })
-  assert.equal(retry.ok, true)
-  assert.equal(rideById(6).status, 'closed')
+  // 恢复后排空队列：同一任务重试原子补退，现金/库存/状态一次性同步，不二次退款
+  const rec = OUTAGE.drainPendingTasks({ kinds: ['reservation_refund'] })
+  assert.equal(rec.failed, 0)
   assert.equal(db.prepare('SELECT status FROM reservations WHERE id=?').get(b.id).status, 'refunded')
+  const refund = db.prepare('SELECT refund_amount FROM reservations WHERE id=?').get(b.id).refund_amount
+  assert.ok(refund > 0)
+  assert.equal(cash(), cash0 - refund, '现金一次性退回')
+  assert.equal(rideSlot(6, 2, 13).booked_count, 0, '名额释放')
+  // 再排空幂等：无任务可执行、现金不变
+  const again = OUTAGE.drainPendingTasks()
+  assert.equal(again.done, 0)
+  assert.equal(cash(), cash0 - refund, '不得二次退款')
+
   // 复园恢复
   assert.equal(EM.controlIncident(r.id, { requestId: 'roll-ctrl' }).ok, true)
   const ro = EM.reopenIncident(r.id, { requestId: 'roll-reopen' })

@@ -1,5 +1,6 @@
-import db, { getSetting, setSetting, tx } from './db.js'
+import db, { getSetting, setSetting, tx, afterCommit } from './db.js'
 import { markFlowDirty } from './flow.js'
+import { enqueueTask, resolveTasksByRef, drainPendingTasks, registerOutageHandler, OUTAGE_KINDS } from './outage.js'
 
 // 分时预约模块：入园时段 9:00~18:00；设施时段 9:00~17:00（末班需留出运行时间）
 const OPEN_HOUR = 9
@@ -79,12 +80,14 @@ const ctx = {
   ticket: () => num(getSetting('ticket'), 120),
   logFinance: null,
   createComplaint: null,
-  // 领队组团联动：设施停运/时段关闭时，source='group' 的在途预约交团模块重排或退款（同事务）
-  handleParkOutageGroup: null,
+  // 领队组团联动：设施停运/时段关闭时，source='group' 的在途预约交团模块登记团停运补偿任务（同事务入队，提交后独立事务补偿）
+  planGroupOutageTasks: null,
   // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
   quoteReservation: null,
   onReservationBooked: null,
   onReservationRefunded: null,
+  // 停运事务提交后排空补偿队列（默认直接排空；index.js 可注入统一日志口径）
+  flushOutageTasks: () => drainPendingTasks(),
   // 园区应急：是否处于全园封控（特别重大安全事件）；为 true 时新生成的入园时段默认关闭
   isParkClosed: null
 }
@@ -111,9 +114,11 @@ function logReservation(rid, action, note = '') {
 
 // 预约离开 booked/被妥善处置（退款成功/核销/人工改签）时，作废旧的挂起补退记录：
 // 保证补偿队列与预约真实状态一致，重试时不会对已处置单二次退款。
+// 同时作废统一停运补偿队列中的预约退款任务（人工已处理，避免二次退款）。
 function resolvePending(rid) {
   db.prepare("UPDATE reservation_pending_actions SET status='obsolete', updated_tick=? WHERE reservation_id=? AND status='pending'")
     .run(ctx.tick(), rid)
+  resolveTasksByRef(OUTAGE_KINDS.RESERVATION, rid)
 }
 
 function entryPrice() { return ctx.ticket() }
@@ -147,8 +152,10 @@ export function ensureSlots() {
   }
 }
 
-// 设备状态变化时联动未来时段：停运则关闭时段并强制退款在途预约；恢复则重新开放
-// 关时段 + 批量退款 + 投诉在同一事务内提交，任一步失败整体回滚（不会时段关了款没退）
+// 设备状态变化时联动未来时段：停运则关闭时段并对在途补偿（散客退款/团行程重排退款）；恢复则重新开放
+// 关时段 + 补偿任务登记 + 投诉在同一事务内提交（主流程绝不留"关了时段但欠补偿未登记"）；
+// 每个补偿动作在外层提交后以【独立事务】执行：成功即同步现金/库存/投诉/账单，
+// 单个失败不影响其他预约与停运主流程，失败动作留在统一补偿队列由引擎每小时重试。
 export function syncRideSlots(ride) {
   if (!ride) return
   return runAtomic(() => {
@@ -162,43 +169,72 @@ export function syncRideSlots(ride) {
       .run(ride.id)
     const pendingAll = db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
                   AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour())
-    // 领队团预约（0 元团单，款项在团账）：交团模块同事务重排行程或全额回退团账（不自建投诉，避免重复）
+    // 领队团预约（0 元团单，款项在团账）：登记团停运补偿任务（重排/回退团账）
     const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
+    // 散客：逐单登记园方退款补偿任务（独立事务执行/重试）
     const guestRows = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
-    if (groupRows.length && ctx.handleParkOutageGroup) {
-      ctx.handleParkOutageGroup(groupRows, { type: 'ride', ride: { id: ride.id, name: ride.name }, reason: ride.status === 'maintenance' ? 'maintenance' : 'closed' })
+    planOutageRefundTasks(guestRows, {
+      reason: ride.status === 'maintenance' ? 'maintenance' : 'closed',
+      title: `设施故障 · ${ride.name}`,
+      note: `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`
+    })
+    if (groupRows.length && ctx.planGroupOutageTasks) {
+      ctx.planGroupOutageTasks(groupRows, { type: 'ride', ride: { id: ride.id, name: ride.name }, reason: ride.status === 'maintenance' ? 'maintenance' : 'closed' })
     }
-    forceRefundByPark(
-      guestRows,
-      `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
-      { title: `设施故障 · ${ride.name}`, skipComplaint: groupRows.length > 0 }
-    )
-    return { ok: true }
+    // 外层提交后逐任务补偿（每任务独立事务，失败留队可恢复）
+    afterCommit(() => { ctx.flushOutageTasks() })
+    // 受影响人数（散客+团队，供应急模块统计退款人数；退款在提交后独立事务逐笔完成）
+    const affectedQty = pendingAll.reduce((s, r) => s + r.qty, 0)
+    return { ok: true, queued: pendingAll.length, affectedQty }
   })
 }
 
-// 园方原因强制全额退款（设备停运 / 超售无法改签）：款全额退回，生成投诉工单
-// 不自建事务：在调用方（syncRideSlots / updateSlot）的事务内逐单退款，
-// 任一单失败即抛出 → 外层整体回滚（不会时段关了款没退完 / 部分单半完成）
-function forceRefundByPark(rows, note, complaintInfo = {}) {
-  let n = 0
+// 登记一批散客园方退款补偿任务（在调用方事务内），并为整批补一条设施故障投诉。
+// 补偿任务在外层提交后独立事务执行；任务自身幂等（按预约单状态条件更新），重试不重复退款。
+function planOutageRefundTasks(rows, { reason = 'park', note = '', title = '', category = null, severity = 2 } = {}) {
   for (const rsv of rows) {
-    refundOne(rsv, 'park', note, { skipComplaint: true })
-    n += rsv.qty
+    enqueueTask(OUTAGE_KINDS.RESERVATION, {
+      refType: 'reservation', refId: rsv.id,
+      idemKey: `rsv-outage-${rsv.id}`,
+      source: reason === 'emergency' ? 'emergency' : 'outage',
+      payload: { reservationId: rsv.id, reason: 'park', note },
+      note
+    })
   }
   if (rows.length && ctx.createComplaint) {
     const anyRide = rows[0].ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rows[0].ride_id) : null
     ctx.createComplaint({
-      category: complaintInfo.category || (anyRide ? 'facility' : 'service'),
-      severity: complaintInfo.severity || 2,
-      title: complaintInfo.title || `预约爽约补偿 · ${anyRide?.name || '园区'}`,
-      content: complaintInfo.content || `已预约 ${rows.length} 单被园方取消，虽已全额退款，但行程受影响，游客要求说法。`,
+      category: category || (anyRide ? 'facility' : 'service'),
+      severity,
+      title: title || `预约爽约补偿 · ${anyRide?.name || '园区'}`,
+      content: `已预约 ${rows.length} 单被园方取消，虽将全额退款，但行程受影响，游客要求说法。`,
       target: anyRide ? { type: 'ride', id: anyRide.id, name: anyRide.name } : { type: '', id: null, name: '' },
       source: 'guest'
     })
   }
-  return n
+  return rows.length
 }
+
+// 统一停运补偿队列处理器：散客预约园方全额退款（在独立事务内调用 refundOne）。
+// 预约已被人工核销/改签/退款/爽约等妥善处置 → 任务作废，绝不二次退款。
+function executeOutageReservationTask(task) {
+  const rsv = getReservation(task.payload?.reservationId ?? task.ref_id)
+  if (!rsv) return { ok: false, obsolete: true, msg: '预约不存在，补偿作废' }
+  if (rsv.status !== 'booked') return { ok: false, obsolete: true, msg: `预约已按「${STATUS_NAMES[rsv.status] || rsv.status}」处置，补偿作废` }
+  // 注意：系统异常（如财务流水失败）必须【继续抛出】，由 outage 执行器的 tx 回滚整个补偿事务；
+  // 仅「预约状态已变更」这一幂等冲突返回 obsolete（对象已被他途妥善处置，不应重试）。
+  try {
+    const r = refundOne(rsv, 'park', task.payload?.note || '设施停运，园方强制退款（补偿重试）',
+      { skipComplaint: true, fromOutageRetry: true })
+    return { ok: true, summary: `预约 ${rsv.code} 园方补退 ¥${r.back}` }
+  } catch (e) {
+    if (e instanceof TxError && e.code === RSV_ERR.STATUS_CONFLICT) {
+      return { ok: false, obsolete: true, msg: '预约状态已变更，补偿作废' }
+    }
+    throw e
+  }
+}
+registerOutageHandler(OUTAGE_KINDS.RESERVATION, executeOutageReservationTask)
 
 // ---------------- 下单 / 改签 / 退款 ----------------
 // 核心一致性：建单+扣库存+预收款+流水+日志在同一事务提交；库存用条件更新原子扣减，
@@ -263,7 +299,7 @@ export function autoBookMember(slot, { memberId, guestName = '会员', amount = 
 }
 
 // 退款核心逻辑（不包事务）：状态条件更新（仅 booked 可退，防重复退款）→ 退现金/记流水 → 释放库存。
-// 失败抛 TxError 由调用方处置：批量场景（forceRefundByPark）直接传播触发外层整体回滚；
+// 失败抛 TxError 由调用方处置：停运补偿处理器中继续抛出，由 outage 执行器的独立事务回滚并留队重试；
 // 单退场景由 refundReservation 包一层 runAtomic 独立事务。reason=park/overbook 全额；late 半价
 function refundOne(rsv, reason, note, opts = {}) {
   const half = reason === 'late'
@@ -275,9 +311,10 @@ function refundOne(rsv, reason, note, opts = {}) {
                         WHERE id=? AND status='booked'`)
     .run(half ? 'refunded_half' : 'refunded', reason, ctx.tick(), ctx.day(), back, fee, rsv.id)
   if (u.changes === 0) throw new TxError(RSV_ERR.STATUS_CONFLICT, '该预约状态已变更，退款未执行，请刷新后重试')
-  // 补偿队列之外发起的退款（人工/拆除/关时段等）成功后作废旧挂起；
-  // 补偿队列自己的补退（opts.fromPendingRetry）不在此处置，由 retryPendingOverbookRefunds 置 done
-  if (!opts.fromPendingRetry) resolvePending(rsv.id)
+  // 补偿队列之外发起的退款（人工/拆除等）成功后作废旧挂起/旧任务；
+  // 补偿队列自己的补退（fromPendingRetry 超售旧队列 / fromOutageRetry 统一停运队列）
+  // 不在此处置，由各自的补偿执行器置 done
+  if (!opts.fromPendingRetry && !opts.fromOutageRetry) resolvePending(rsv.id)
 
   if (back > 0) {
     setSetting('cash', Math.round(ctx.cash() - back))
@@ -615,8 +652,9 @@ function findAlternativeSlots(rsv) {
 
 // 爽约：所有已过时段未核销的预约（含跨天兜底）标记 noshow，预收款没收（记入「违约」），释放爽约计数
 // 整批一个事务；状态条件更新保证与退款/核销并发时不会重复没收。
-// 关键排除：存在 pending 超售补退（reservation_pending_actions）的预约是园方超售、退款事务失败的待补偿单，
-// 绝不能按爽约没收预收款（否则欠款变违约金、经营数据虚报）；它们保持 booked，由 retryPendingOverbookRefunds 补退。
+// 关键排除：存在 pending 补偿（超售补退 reservation_pending_actions 或停运统一补偿 outage_tasks）
+// 的预约是园方原因待补偿单，绝不能按爽约没收预收款（否则欠款变违约金、经营数据虚报）；
+// 它们保持 booked，由补偿队列重试补退。
 export function expireNoShow(hour) {
   const day = ctx.day()
   // 领队团预约由组团模块统一核销（款项走团账），散客爽约批处理不触达
@@ -627,6 +665,10 @@ export function expireNoShow(hour) {
                           AND NOT EXISTS (
                             SELECT 1 FROM reservation_pending_actions p
                             WHERE p.reservation_id=r.id AND p.status='pending'
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM outage_tasks ot
+                            WHERE ot.kind='reservation_refund' AND ot.ref_id=r.id AND ot.status='pending'
                           )`).all(day, day, hour)
   let qty = 0
   runAtomic(() => {
@@ -741,14 +783,14 @@ export function updateSlot(id, patch) {
 
   return runAtomic(() => {
     if (patch.status === 'closed') {
-      // 关闭时段：在途预约园方全额退款并生成投诉
+      // 关闭时段：在途预约登记园方全额退款补偿任务（提交后独立事务执行/重试）
       const pendingAll = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
-      // 领队团预约交团模块处理（重排 / 回退团账），其余园方全额退款
+      // 领队团预约登记团停运补偿任务（重排 / 回退团账），散客登记园方退款任务
       const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
       const pending = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
-      if (groupRows.length && ctx.handleParkOutageGroup) {
+      if (groupRows.length && ctx.planGroupOutageTasks) {
         const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
-        ctx.handleParkOutageGroup(groupRows, {
+        ctx.planGroupOutageTasks(groupRows, {
           type: s.scope,
           ride: ride || null,
           reason: 'slot_closed'
@@ -756,9 +798,15 @@ export function updateSlot(id, patch) {
       }
       if (pending.length) {
         const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
-        forceRefundByPark(pending, `运营关闭 ${s.day}日 ${s.hour}:00 时段，园方强制退款`,
-          { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service', skipComplaint: groupRows.length > 0 })
+        planOutageRefundTasks(pending, {
+          reason: 'slot_closed',
+          note: `运营关闭 ${s.day}日 ${s.hour}:00 时段，园方强制退款`,
+          title: `${ride ? ride.name : '分时入园'} · 时段临时取消`,
+          category: ride ? 'facility' : 'service'
+        })
       }
+      // 外层提交后逐任务补偿（独立事务，失败留队由引擎重试）
+      afterCommit(() => { ctx.flushOutageTasks() })
     }
     vals.push(id)
     db.prepare(`UPDATE reservation_slots SET ${sets.join(',')} WHERE id=?`).run(...vals)
@@ -900,9 +948,11 @@ export function reservationStats() {
 
 export const RESERVATION_CONST = { OPEN_HOUR, ENTRY_HOURS, RIDE_HOURS, GENERATE_DAYS, DEFAULT_ENTRY_CAP, DEFAULT_RIDE_CAP }
 
-// 全园封控（特别重大安全事件）：关停全部未来入园时段，在途入园预约园方全额退款；
-// 团入园行程交团模块同事务重排/退款，散客预约自动生成投诉。返回退款人数。
-// 不自建事务：在调用方（应急模块封控事务）内执行，任一步失败抛错由外层整体回滚。
+// 全园封控（特别重大安全事件）：关停全部未来入园时段，在途入园预约登记园方全额退款补偿任务；
+// 团入园行程登记团停运补偿任务（重排/退款），散客预约生成安全投诉。
+// 不自建事务：在调用方（应急模块封控事务）内登记任务；补偿动作在外层提交后以独立事务逐笔执行，
+// 单笔失败留队由引擎重试——任一步失败都不会"封了但欠款没退"，且重试不重复退款。
+// 返回受影响预约人数（含散客与团）。
 export function emergencyCloseEntrySlots(note = '园区安全事件，全园临时封控') {
   db.prepare("UPDATE reservation_slots SET status='closed' WHERE scope='entry' AND day>=?")
     .run(ctx.day())
@@ -910,23 +960,19 @@ export function emergencyCloseEntrySlots(note = '园区安全事件，全园临�
                 AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ctx.day(), ctx.day(), ctx.hour())
   const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
   const guestRows = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
-  if (groupRows.length && ctx.handleParkOutageGroup) {
-    ctx.handleParkOutageGroup(groupRows, { type: 'entry', ride: null, reason: 'emergency' })
+  if (groupRows.length && ctx.planGroupOutageTasks) {
+    ctx.planGroupOutageTasks(groupRows, { type: 'entry', ride: null, reason: 'emergency' })
   }
+  planOutageRefundTasks(guestRows, note, {
+    reason: 'emergency',
+    category: 'safety',
+    severity: 3,
+    title: '全园封控 · 入园预约取消'
+  })
   let qty = 0
-  for (const r of groupRows) qty += r.qty
-  forceRefundByPark(
-    guestRows,
-    note,
-    {
-      category: 'safety',
-      severity: 3,
-      title: '全园封控 · 入园预约取消',
-      content: '园区因安全事件临时封控，您的入园预约已被园方取消，虽已全额退款，但行程受到影响。',
-      skipComplaint: groupRows.length > 0
-    }
-  )
-  for (const r of guestRows) qty += r.qty
+  for (const r of pendingAll) qty += r.qty
+  // 外层应急事务提交后逐任务补偿（每任务独立事务，失败留队可恢复）
+  afterCommit(() => { ctx.flushOutageTasks() })
   return qty
 }
 
@@ -935,6 +981,23 @@ export function emergencyReopenEntrySlots() {
   db.prepare("UPDATE reservation_slots SET status='open' WHERE scope='entry' AND day>=?")
     .run(ctx.day())
   return { ok: true }
+}
+
+// 设施拆除：在途散客预约登记园方退款补偿任务（不建投诉，拆除为运营决策；在调用方拆除事务内入队）。
+// 返回登记任务数；补偿动作在外层提交后独立事务执行，失败留队重试，人工先退则任务作废不二次退款。
+export function planRideDestroyRefundTasks(rideId) {
+  const rows = db.prepare("SELECT * FROM reservations WHERE ride_id=? AND status='booked'").all(rideId)
+    .filter(r => !(r.source === 'group' && r.group_item_id))
+  for (const rsv of rows) {
+    enqueueTask(OUTAGE_KINDS.RESERVATION, {
+      refType: 'reservation', refId: rsv.id,
+      idemKey: `rsv-destroy-${rsv.id}`,
+      source: 'manual',
+      payload: { reservationId: rsv.id, reason: 'park', note: '设施拆除，园方强制退款' }
+    })
+  }
+  afterCommit(() => { ctx.flushOutageTasks() })
+  return rows.length
 }
 
 // 领队组团模块复用：时段行查询（含余量）

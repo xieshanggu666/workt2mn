@@ -5,7 +5,7 @@ import {
   autoCheckin, expireNoShow, autoBookDemand, retryPendingOverbookRefunds,
   createReservation, cancelReservation, rescheduleReservation, checkinReservation,
   listSlots, listReservations, reservationLogs, updateSlot, reservationStats,
-  refundReservation, autoBookMember
+  refundReservation, autoBookMember, planRideDestroyRefundTasks
 } from './reservations.js'
 import {
   initMaintenanceContext, backfillMaintenanceOrders, processMaintenance,
@@ -35,9 +35,13 @@ import {
 import {
   initGroupContext, submitGroup, confirmGroup, rejectGroup, cancelGroup,
   payBalance, checkinGroupItem, refundGroupLeg, rerouteGroupItem,
-  refundInterruptedItem, handleParkOutageGroupRows, refundGroupsByRide,
+  refundInterruptedItem, planParkOutageGroupTasks, refundGroupsByRide,
   autoSimulateGroup, autoGroupTick, listGroups, groupDetail, groupStats, GROUP_CONST
 } from './groups.js'
+import {
+  initOutageContext, recoverCompensations, drainPendingTasks,
+  listOutageTasks, outageTaskLogs, outageStats
+} from './outage.js'
 import {
   initFlowContext, refreshForecastSnapshots, settleForecastLearning,
   runReconcile, listFindings, ignoreFinding, closedLoopOverview, reconcileStats
@@ -69,6 +73,7 @@ import {
   listContracts, contractDetail, terminateContract, activeContract as activePartnerContract,
   recordSale as partnerRecordSale, isPartnerVendor,
   organicReturn, recordReturn as partnerRecordReturn,
+  enqueuePartnerRefundTask,
   levyComplaintFine,
   issueSettlement, paySettlement, retryOverdueSettlements, autoIssueSettlements,
   listSales as listPartnerSales, listSettlements, settlementDetail, listFines,
@@ -178,7 +183,9 @@ initPartnerContext({
   reserveVendorStock: (vendorId, qty) => reserveVendorStock(vendorId, qty, { partner: true }),
   customerReturn: (vendorId, qty, opts) => customerReturn(vendorId, qty, { ...opts, partner: true }),
   partnerCogs: (vendorId, from, to) => partnerCogs(vendorId, from, to),
-  autoLinkVendor: (vendorId, type) => autoLinkVendor(vendorId, type)
+  autoLinkVendor: (vendorId, type) => autoLinkVendor(vendorId, type),
+  // 停运补偿联营退款：与红冲同一事务扣减现金（园方代付游客，红冲在结算时向商户收回）
+  deductCash: (amount) => setSetting('cash', Math.round(state.cash() - amount))
 })
 // 设施域服务：时钟 / 现金 / 财务流水（升级扣款与流水同事务原子提交）
 initRideContext({ logFinance })
@@ -200,9 +207,15 @@ initGroupContext({
   logFinance,
   createComplaint: (payload) => createComplaint(payload)
 })
-// 预约停运联动 → 团行程重排/退款（同一事务内执行）
+// 设施停运统一补偿中心：时钟（处理器由各业务模块自行注册：预约/团队/联营）
+initOutageContext({
+  day: () => state.day(),
+  hour: () => state.hour(),
+  tick: () => state.tick()
+})
+// 预约停运联动 → 团行程停运补偿任务（同事务登记，提交后独立事务逐团重排/退款，失败可重试）
 initReservationContext({
-  handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info),
+  planGroupOutageTasks: (rows, info) => planParkOutageGroupTasks(rows, info, 'outage'),
   // 全园封控（特别重大安全事件未复园）：新生成的未来入园时段默认关闭，防止封控期被下单
   isParkClosed: () => db.prepare("SELECT COUNT(*) n FROM incidents WHERE severity=4 AND status IN ('graded','contained','evacuating','controlled')").get().n > 0
 })
@@ -774,8 +787,24 @@ function tick() {
 
   // ---- 分时预约闭环 ----
   ensureSlots()                       // 维护未来三天的入园/设施时段库存
-  // 异常恢复必须先于爽约扫描：超售退款事务失败的挂起单先尝试补退，
-  // 补退成功才释放名额/退现金，仍失败则保持 booked，且不会被下面的爽约扫描误没收
+  // 异常恢复必须先于爽约/结案扫描：
+  // ① 先排空设施停运统一补偿队列（散客预约退款 / 团队行程重排退款 / 联营退款），
+  //    逐任务独立事务，成功才同步现金/库存/投诉/账单，失败留队下一小时重试；
+  // ② 再补退旧的散客超售退款挂起单。
+  //    仍失败的预约保持 booked，且不会被下面的爽约扫描误没收，人工处置后任务自动作废、绝不二次退款。
+  const outageRecover = recoverCompensations()
+  if (outageRecover.done > 0) {
+    console.log(`[outage] 停运补偿恢复 ${outageRecover.done} 任务（预约 ${outageRecover.byKind.reservation_refund || 0} / 团队 ${outageRecover.byKind.group_outage || 0} / 联营 ${outageRecover.byKind.partner_refund || 0}）；剩余挂起 ${outageRecover.remaining}`)
+  }
+  // 仍有补偿失败挂起（资金/库存侧故障等）：登记经营事件提醒人工在补偿中心重试，
+  // 期间相关预约被爽约/结案扫描显式排除，不会把园方欠款误没收为违约金
+  if (outageRecover.failed > 0 && outageRecover.remaining > 0) {
+    const s = outageStats()
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(state.tick(), day, 'outage', '停运补偿重试仍失败 · 任务挂起',
+        `${outageRecover.failed} 个停运补偿任务本小时重试仍失败（散客预约 ${s.pendingByKind.reservation} / 团队行程 ${s.pendingByKind.group} / 联营退款 ${s.pendingByKind.partner}），相关现金未退、名额未释放、预约保持待核销且不会按爽约没收。请在「停运补偿中心」查看错误并重试，人工先行处理的任务会自动作废，绝不二次扣款/退款。`,
+        -1, 'active')
+  }
   const overbookRetry = retryPendingOverbookRefunds()
   if (overbookRetry.recovered > 0) {
     console.log(`[reservations] 超售补退恢复 ${overbookRetry.recovered} 单 / ${overbookRetry.qty} 人，退款 ¥${overbookRetry.amount}；剩余挂起 ${overbookRetry.remaining}`)
@@ -1145,6 +1174,7 @@ app.get('/api/state', (req, res) => {
     complaintStats: complaintStats(),
     wordOfMouth: state.wordOfMouth(),
     reservationStats: reservationStats(),
+    outageStats: outageStats(),
     entrySlots: listSlots({ scope: 'entry' }),
     reservations: listReservations({ limit: 100 }),
     // 领队组团
@@ -1311,14 +1341,11 @@ app.post('/api/rides/:id', (req, res) => {
 
 app.delete('/api/rides/:id', (req, res) => {
   const id = num(req.params.id)
-  // 拆除前对在途预约按园方原因全额退款（散客逐单容错；团行程走团账同事务回退）
+  // 拆除前为在途散客预约/团队行程登记园方退款补偿任务（统一补偿队列：
+  // 拆除事务提交后独立事务逐笔退款，单笔失败留队可重试，人工先处理不二次退款）
   try {
     tx(() => {
-      const pending = db.prepare("SELECT * FROM reservations WHERE ride_id=? AND status='booked'").all(id)
-      for (const r of pending) {
-        if (r.source === 'group' && r.group_item_id) continue
-        refundReservation(r, 'park', '设施拆除，园方强制退款')
-      }
+      planRideDestroyRefundTasks(id)
       refundGroupsByRide(id)
       // 在途检修工单作废
       cancelOrdersByRide(id)
@@ -2117,6 +2144,32 @@ app.get('/api/groups/:id', (req, res) => {
   const d = groupDetail(num(req.params.id))
   if (!d) return res.status(404).json({ ok: false, msg: '团单不存在' })
   res.json(d)
+})
+
+// ---- 设施停运统一补偿队列（散客预约退款 / 团队行程重排退款 / 联营退款红冲） ----
+app.get('/api/outage/tasks', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listOutageTasks({ status: q.status || 'pending', kind: q.kind || null, limit: 300 }),
+    stats: outageStats()
+  })
+})
+
+app.get('/api/outage/tasks/:id', (req, res) => {
+  const logs = outageTaskLogs(num(req.params.id))
+  if (!logs.length) return res.status(404).json({ ok: false, msg: '补偿任务不存在' })
+  res.json({ logs })
+})
+
+// 人工触发补偿重试（引擎每小时也会自动排空；逐任务独立事务，失败留队，不二次扣款/退款）
+app.post('/api/outage/retry', (req, res) => {
+  const result = drainPendingTasks()
+  if (result.done > 0) {
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(state.tick(), state.day(), 'outage', '停运补偿人工重试',
+        `人工触发停运补偿队列重试：本次完成 ${result.done} 个补偿任务（预约 ${result.byKind.reservation_refund || 0} / 团队 ${result.byKind.group_outage || 0} / 联营 ${result.byKind.partner_refund || 0}），作废 ${result.obsolete} 个，仍失败 ${result.failed} 个（系统将继续自动重试）。`, 0, 'resolved')
+  }
+  res.json({ ok: true, ...result })
 })
 
 // 领队提交入园 + 多设施行程（幂等）

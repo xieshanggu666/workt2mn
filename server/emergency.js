@@ -136,10 +136,11 @@ function lockdownRide(inc, rideId, note) {
   let refundQty = 0
   if (!openOrder && prev !== 'closed') {
     db.prepare("UPDATE rides SET status='closed' WHERE id=?").run(rideId)
-    const before = pendingRideRiders(rideId)
+    // 停运联动：关时段 + 登记补偿任务（散客退款/团队重排退款）；事务提交后逐任务独立事务补偿
     const sync = ctx.syncRideSlots?.({ ...ride, status: 'closed' })
     if (sync && !sync.ok) throw new Error(`设施停运联动失败：${sync.msg || sync.code || '未知错误'}`)
-    refundQty = Math.max(0, before - pendingRideRiders(rideId))
+    // 受影响人数由预约模块按入队预约统计（退款在提交后独立事务完成，可能在重试队列中恢复）
+    refundQty = Math.max(0, sync?.affectedQty ?? (pendingRideRiders(rideId) - 0))
   }
   return { ride: ride.name, refundQty }
 }

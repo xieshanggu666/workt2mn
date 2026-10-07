@@ -16,6 +16,7 @@ import MembersView from '@/components/MembersView.vue'
 import GiftView from '@/components/GiftView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
 import GroupsView from '@/components/GroupsView.vue'
+import OutageView from '@/components/OutageView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
 import EmergencyView from '@/components/EmergencyView.vue'
@@ -40,6 +41,7 @@ const navs = [
   { k: 'gifts', icon: '🎁', label: '转赠·家庭账户' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
   { k: 'groups', icon: '🧑‍✈️', label: '领队组团' },
+  { k: 'outage', icon: '🧯', label: '停运补偿中心' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
   { k: 'emergency', icon: '🚨', label: '应急指挥' },
@@ -84,6 +86,7 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.schedulingStats.coverageBlocks">⛔ {{ store.schedulingStats.coverageBlocks }} 项关键岗位缺岗</span>
           <span class="halo red" v-if="store.closedLoop?.reconcile?.blocks">🔍 {{ store.closedLoop.reconcile.blocks }} 项闭环账实不符待核对</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
+          <span class="halo red" v-if="store.outageStats.pending" @click="view = 'outage'" style="cursor:pointer">🧯 {{ store.outageStats.pending }} 笔停运补偿挂起</span>
           <span class="halo" v-if="store.groupStats.pending">🧑‍✈️ {{ store.groupStats.pending }} 个团队待确认</span>
           <span class="halo red" v-if="store.groupStats.interrupted">🚧 {{ store.groupStats.interrupted }} 段团队行程停运待处置</span>
           <span class="halo red" v-if="store.purchaseStats.criticalFindings">📦 {{ store.purchaseStats.criticalFindings }} 项库存紧急异常（断货/逾期/账实）</span>
@@ -124,6 +127,7 @@ onMounted(store.refresh)
         <GiftView v-else-if="view === 'gifts'" />
         <ReservationsView v-else-if="view === 'reservations'" />
         <GroupsView v-else-if="view === 'groups'" />
+        <OutageView v-else-if="view === 'outage'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
         <EmergencyView v-else-if="view === 'emergency'" />

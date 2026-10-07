@@ -22,7 +22,7 @@ G.initGroupContext({
   createComplaint: p => { complaints.push(p); return { id: complaints.length, code: 'TS' + String(complaints.length).padStart(4, '0') } }
 })
 RSV.initReservationContext({
-  handleParkOutageGroup: (rows, info) => G.handleParkOutageGroupRows(rows, info)
+  planGroupOutageTasks: (rows, info) => G.planParkOutageGroupTasks(rows, info, 'outage')
 })
 
 const cash = () => Number(getSetting('cash'))

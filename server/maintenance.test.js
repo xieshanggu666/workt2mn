@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 const { default: db, getSetting, setSetting } = await import('./db.js')
 const RSV = await import('./reservations.js')
 const MAINT = await import('./maintenance.js')
+const OUTAGE = await import('./outage.js')
 
 // ---- 测试上下文：记录财务流水与投诉，可注入故障 ----
 const finLogs = []
@@ -79,31 +80,42 @@ test('报修停运联动：工单+停运+关时段+批量退款+投诉同一事�
   assert.equal(openOrders().length, 1, '应有一个在途工单')
 })
 
-test('停运联动回滚：退款中段失败 → 工单/停运/关时段/退款/投诉整体回滚并返回失败', () => {
+test('停运补偿可恢复：退款流水失败不阻断报修/停运/关时段，补偿任务挂起且现金/预约不动，恢复后逐笔补退', () => {
   const s = rideSlot(2, 2, 10)
   const b = RSV.createReservation({ scope: 'ride', rideId: 2, slotId: s.id, qty: 2, requestId: 'm2-b1' })
   assert.equal(b.ok, true)
   const cash0 = cash()
   const complaints0 = complaints.length
 
+  // 报修主事务（建工单+停运+关时段+登记补偿任务+投诉）提交；退款执行阶段流水持续失败
   failOnRefundFinance = true
   const r = MAINT.createMaintenanceOrder(2, 'manual')
+  for (let i = 0; i < 3; i++) OUTAGE.drainPendingTasks({ kinds: ['reservation_refund'] })
   failOnRefundFinance = false
 
-  assert.equal(r.ok, false, '联动失败必须返回失败而非假成功')
-  assert.equal(rideById(2).status, 'operating', '设施状态应回滚为运营中')
-  assert.equal(slotById(s.id).status, 'open', '时段应回滚为开放')
-  assert.equal(rsvById(b.id).status, 'booked', '预约应回滚为在途')
+  // 报修/停运主流程成功（不应被退款执行失败回滚），补偿保持挂起
+  assert.equal(r.ok, true, '退款执行失败不应阻断报修与设施停运')
+  assert.equal(rideById(2).status, 'maintenance', '设施应转入检修停运')
+  assert.equal(slotById(s.id).status, 'closed', '时段应关停')
+  assert.ok(openOrderOf(2), '检修工单应已建立')
+  assert.equal(complaints.length, complaints0 + 1, '设施故障投诉应随主事务生成')
+  // 资金/库存/预约保持一致：现金未退、名额未释放、预约仍待核销（不虚报）
+  assert.equal(rsvById(b.id).status, 'booked', '补偿未成功前预约保持待核销')
   assert.equal(rsvById(b.id).refund_amount, 0, '不应留下退款留痕')
   assert.equal(cash(), cash0, '现金不得变化')
-  assert.equal(complaints.length, complaints0, '不应生成投诉')
-  assert.equal(openOrderOf(2), undefined, '设施 2 的工单应一并回滚')
+  assert.equal(slotById(s.id).booked_count, 2, '名额不得释放')
 
-  // 故障恢复后重试应成功（无残留状态阻塞）
-  const retry = MAINT.createMaintenanceOrder(2, 'manual')
-  assert.equal(retry.ok, true)
-  assert.equal(rideById(2).status, 'maintenance')
+  // 恢复后排空补偿队列：原子补退，现金/库存/状态一次性同步
+  const rec = OUTAGE.drainPendingTasks({ kinds: ['reservation_refund'] })
+  assert.equal(rec.failed, 0)
   assert.equal(rsvById(b.id).status, 'refunded')
+  assert.equal(rsvById(b.id).reason, 'park')
+  assert.equal(cash(), cash0 - rsvById(b.id).refund_amount, '现金按退款额扣减')
+  assert.equal(slotById(s.id).booked_count, 0, '名额释放')
+  // 再排空幂等：不二次退款
+  const again = OUTAGE.drainPendingTasks()
+  assert.equal(again.done, 0)
+  assert.equal(cash(), cash0 - rsvById(b.id).refund_amount, '不得二次退款')
 })
 
 test('停运联动回滚：投诉建单失败 → 同样整体回滚', () => {

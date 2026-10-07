@@ -1,4 +1,5 @@
 import db, { getSetting, setSetting, tx } from './db.js'
+import { registerOutageHandler, enqueueTask, OUTAGE_KINDS } from './outage.js'
 
 // 园区联营商户结算模块：
 //   商户申请入驻（新商户/存量商铺转联营）→ 审核签约（扣点率/账期/保证金/会员优惠分摊）
@@ -29,9 +30,52 @@ const ctx = {
   // (vendorId, qty, dayFrom, dayTo) => { cogs }
   partnerCogs: null,
   // (vendorId, type) 新商户建铺后按类型自动挂供货物资
-  autoLinkVendor: null
+  autoLinkVendor: null,
+  // 停运补偿退款扣现金（与红冲同一事务）：默认直接改 settings.cash，index.js 可注入统一口径
+  deductCash: null
 }
 export function initPartnerContext(deps) { Object.assign(ctx, deps) }
+
+// 统一停运补偿队列处理器：联营商铺退款（园方当场代付游客 + 负向红冲行结转账单）。
+// 红冲行按任务 id 幂等，重试不二次退款；现金、分账流水、账单在同一事务同步。
+function executePartnerRefundTask(task) {
+  const p = task.payload || {}
+  const vendorId = num(p.vendorId ?? task.ref_id)
+  const v = getVendor(vendorId)
+  if (!v) return { ok: false, obsolete: true, msg: `商铺 ${vendorId} 不存在，补偿作废` }
+  const qty = Math.max(1, Math.round(num(p.qty, 1)))
+  const refund = Math.max(0, Math.round(num(p.refund)))
+  if (refund <= 0) return { ok: false, obsolete: true, msg: '退款额为 0，补偿作废' }
+  // 已无有效联营合同（如已终止清算）：无法红冲，置失败等待人工，不擅自按自营口径退款
+  if (!activeContract(vendorId)) {
+    return { ok: false, code: 'NO_CONTRACT', msg: `商铺「${v.name}」无有效联营合同，无法红冲，请人工处理` }
+  }
+  const pr = outagePartnerReturn(vendorId, qty, {
+    refund, complaintId: num(p.complaintId) || null, reason: p.note || '设施停运/经营异常联营退款',
+    outageTaskId: task.id, source: p.source || 'organic'
+  })
+  if (pr.replay) return { ok: true, summary: `商铺「${v.name}」退款已红冲（重放，不重复退款）` }
+  if (!pr.ok) return { ok: false, code: pr.code, msg: pr.msg }
+  // 现金扣减（园方代付游客，红冲在结算时向商户收回）——与红冲同事务，回滚则一起回滚
+  const deduct = ctx.deductCash || (amt => setSetting('cash', Math.round(ctx.cash() - amt)))
+  deduct(refund)
+  ctx.logFinance?.(ctx.day(), '商业', -refund,
+    `「${v.name}」联营游客退款 ${qty} 份（${p.note || '停运补偿'} · 红冲任务 #${task.id}）`)
+  return { ok: true, summary: `商铺「${v.name}」联营退款 ¥${refund} 已红冲` }
+}
+registerOutageHandler(OUTAGE_KINDS.PARTNER, executePartnerRefundTask)
+
+// 对外登记一笔可恢复的联营退款补偿任务（停运/召回等异常路径调用；在调用方事务内入队）。
+// 返回 { id, created }。
+export function enqueuePartnerRefundTask({ vendorId, qty, refund, complaintId = null, note = '', source = 'outage', idemKey = '' } = {}) {
+  return enqueueTask(OUTAGE_KINDS.PARTNER, {
+    refType: 'vendor', refId: num(vendorId),
+    idemKey: idemKey || `partner-refund-${num(vendorId)}-${ctx.tick()}-${Math.round(num(refund))}-${Math.round(num(qty))}`,
+    source,
+    payload: { vendorId: num(vendorId), qty: Math.round(num(qty)), refund: Math.round(num(refund)), complaintId: num(complaintId) || null, note, source: 'organic' },
+    note: note || `联营商铺 #${vendorId} 退款 ¥${refund}`
+  })
+}
 
 export class PartnerError extends Error {
   constructor(code, msg, extra = {}) { super(msg); this.code = code; Object.assign(this, extra) }
@@ -254,7 +298,8 @@ export function recordSale(vendorId, { qty = 1, gross, bill, source = 'organic',
 
 // 退货红冲行通用构造：所有金额字段为负，与正向销售同口径（结算时直接 SUM 净额）
 function insertReturnRow({ vendorId, contractId, memberId, source, qty, grossNeg, billNeg,
-                           commissionRate, memberDiscountShare, originSaleId = null, complaintId = null, note = '' }) {
+                           commissionRate, memberDiscountShare, originSaleId = null, complaintId = null,
+                           outageTaskId = null, note = '' }) {
   const discountNeg = grossNeg - billNeg                                   // 负数（优惠冲回）
   const parkShareN = -Math.round(-billNeg * commissionRate)               // 负数
   const merchantShareN = billNeg - parkShareN                             // 负数
@@ -264,12 +309,12 @@ function insertReturnRow({ vendorId, contractId, memberId, source, qty, grossNeg
   const r = db.prepare(`INSERT INTO partner_sales
     (code,vendor_id,contract_id,member_id,source,qty,gross,bill_amount,member_discount,
      merchant_share,park_share,merchant_discount_borne,park_discount_borne,
-     commission_rate,member_discount_share,kind,origin_sale_id,complaint_id,day,tick,note)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'return',?,?,?,?,?)`)
+     commission_rate,member_discount_share,kind,origin_sale_id,complaint_id,outage_task_id,day,tick,note)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'return',?,?,?,?,?,?)`)
     .run('LS' + String(id).padStart(4, '0'), vendorId, contractId, memberId || null, source, -qty,
          grossNeg, billNeg, discountNeg, merchantShareN, parkShareN, mdBorneN, pdBorneN,
          commissionRate, memberDiscountShare, originSaleId || null, num(complaintId) || null,
-         ctx.day(), ctx.tick(), note)
+         num(outageTaskId) || null, ctx.day(), ctx.tick(), note)
   const rid = Number(r.lastInsertRowid)
   return { id: rid, code: 'LS' + String(rid).padStart(4, '0'), merchantShare: merchantShareN, bill: billNeg, gross: grossNeg }
 }
@@ -325,6 +370,41 @@ export function organicReturn(vendorId, qty, { refund = null, complaintId = null
     })
   } catch (e) {
     return { ok: false, code: e.code || 'TX_FAILED', msg: e.message || '退货登记失败' }
+  }
+}
+
+// 统一停运补偿队列可恢复版联营退款：写负向红冲行（按 outageTaskId 幂等，重试不重复红冲）。
+// 不自行扣现金：由调用方（补偿执行器/召回）在同一事务内按统一口径扣现金并记财务流水，
+// 保证现金、分账流水与账单三者同生共死、可重试恢复。
+// 返回 { ok, row, refund }；该任务已红冲过（重试）返回 { ok:true, replay:true }。
+export function outagePartnerReturn(vendorId, qty, { refund = null, complaintId = null, reason = '', outageTaskId = null, source = 'organic' } = {}) {
+  const contract = activeContract(vendorId)
+  if (!contract) return { ok: false, code: 'NO_CONTRACT', msg: '商铺无有效联营合同' }
+  const v = getVendor(vendorId)
+  const q = Math.max(1, Math.round(num(qty)))
+  const refundAmt = Math.max(0, Math.round(refund ?? q * (v?.price || 0)))
+  if (refundAmt <= 0) return { ok: false, code: 'BAD_ARG', msg: '退款金额必须大于 0' }
+  // 补偿重试幂等：同一补偿任务已写过红冲行则直接重放，绝不二次退款
+  if (outageTaskId) {
+    const dup = db.prepare("SELECT id FROM partner_sales WHERE outage_task_id=? AND kind='return'").get(num(outageTaskId))
+    if (dup) return { ok: true, replay: true, id: dup.id, refund: refundAmt }
+  }
+  try {
+    const grossNeg = -Math.round(q * (v?.price || 0))
+    const row = insertReturnRow({
+      vendorId, contractId: contract.id, source, qty: q, grossNeg, billNeg: -refundAmt,
+      commissionRate: contract.commission_rate, memberDiscountShare: contract.member_discount_share,
+      complaintId, outageTaskId, note: reason || '停运补偿联营退款红冲'
+    })
+    logPartner('sale', row.id, 'return', `停运/补偿联营退款 ${q} 份，退款 ¥${refundAmt}（红冲结转账单）`, vendorId)
+    return { ok: true, ...row, refund: refundAmt }
+  } catch (e) {
+    // 并发下唯一索引兜底：已红冲则按重放处理
+    if (outageTaskId) {
+      const dup = db.prepare("SELECT id FROM partner_sales WHERE outage_task_id=? AND kind='return'").get(num(outageTaskId))
+      if (dup) return { ok: true, replay: true, id: dup.id, refund: refundAmt }
+    }
+    return { ok: false, code: e.code || 'TX_FAILED', msg: e.message || '联营退款红冲失败' }
   }
 }
 
