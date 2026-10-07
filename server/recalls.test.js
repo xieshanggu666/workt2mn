@@ -359,3 +359,110 @@ test('统计口径与详情', () => {
   assert.ok(d.logs.length >= 2)
   assert.ok(d.quote)
 })
+
+// ---- 联营退款失败 → 统一补偿队列重试：现金/红冲账单/库存留痕一次到位，人工已退不重复 ----
+test('联营召回退款失败补偿：QUEUED 后引擎重试红冲成功，重复执行不重复退款/红冲', async () => {
+  const COMP = await import('./compensation.js')
+  const m = P.listMaterials().find(x => x.name.includes('一次性杯'))
+  const vid = m.vendors[0]?.id || db.prepare('SELECT id FROM vendors ORDER BY id LIMIT 1').get().id
+  linkOnly(vid, m.id)
+  // 前序用例可能已消耗该物资库存：下一笔 10 个收货，保证有 5 个可售可召回
+  const po = P.createOrder({ supplier_id: m.preferred_supplier_id, items: [{ material_id: m.id, qty: 10, unit_cost: m.std_cost || 1 }] })
+  P.submitOrder(po.id); P.approveOrder(po.id)
+  const itId = P.orderDetail(po.id).order.items[0].id
+  P.receiveOrder(po.id, [{ item_id: itId, qty: 10 }])
+  db.prepare(`INSERT INTO partner_contracts(application_id,vendor_id,commission_rate,member_discount_share,settle_period_days,deposit,start_day,status,sign_day,sign_tick)
+              VALUES(NULL,?,0.2,1,7,0,1,'active',1,0)`).run(vid)
+  P.applyVendorSales(vid, 5, { partner: true })
+
+  const r = R.createRecall({ supplier_id: m.preferred_supplier_id, material_id: m.id, reason: '杯材回收料超标', severity: 2 })
+  const id = r.id
+  R.acknowledgeVendor(id, vid)
+  const rvRow = R.recallDetail(id).recall.vendors.find(v => v.vendor_id === vid)
+  const v = db.prepare('SELECT price FROM vendors WHERE id=?').get(vid)
+  const refund5 = 5 * v.price
+  const cashBefore = cash()
+  const redBefore = db.prepare("SELECT COUNT(*) n FROM partner_sales WHERE kind='return'").get().n
+
+  // vendorRefund 在红冲/现金事务失败时会把该退款挂入统一补偿队列（enqueueDetached）；
+  // 这里直接挂载同构任务，验证补偿处理器的恢复路径（现金代付 + 红冲 + 库存留痕）：
+  const q = COMP.enqueueDetached({
+    domain: 'partner', action: 'partner_recall_refund',
+    idemKey: `recall:${id}:rv:${rvRow.id}:qty:5`,
+    refType: 'recall_vendor', refId: rvRow.id, priority: 2, source: 'retry',
+    payload: { recallId: id, recallVendorId: rvRow.id, vendorId: vid, qty: 5, isPartner: true },
+    note: '测试挂载联营退款补偿'
+  })
+  assert.equal(q.ok, true)
+
+  // 引擎执行：现金代付 + 红冲行 + 库存留痕
+  const stats = COMP.runCompensations()
+  assert.equal(stats.done, 1, stats.failed ? '补偿应成功' : '')
+  assert.equal(cash(), cashBefore - refund5, '园方代付游客退款现金扣减一次')
+  const redAfter = db.prepare("SELECT COUNT(*) n FROM partner_sales WHERE kind='return'").get().n
+  assert.equal(redAfter, redBefore + 1, '红冲行写入一条（结转下张联营账单）')
+  const red = db.prepare("SELECT * FROM partner_sales WHERE kind='return' ORDER BY id DESC LIMIT 1").get()
+  assert.equal(red.settlement_id, 0, '红冲未出账，结转下张结算账单净额冲减')
+  assert.equal(red.bill_amount, -refund5)
+  const rvAfter = db.prepare('SELECT * FROM recall_vendors WHERE id=?').get(rvRow.id)
+  assert.equal(rvAfter.refund_qty, 5)
+  assert.equal(rvAfter.refund_amount, refund5)
+
+  // 任务已 done；再次引擎扫描不重复退款/红冲
+  COMP.runCompensations()
+  assert.equal(cash(), cashBefore - refund5, '现金不得二次扣减')
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM partner_sales WHERE kind='return'").get().n, redBefore + 1, '不得重复红冲')
+
+  // 清理现场
+  const remain = R.recallDetail(id).recall.remain_quarantine
+  if (remain > 0) R.destroyBatches(id, remain)
+  R.payCompensation(id, R.compensationQuote(id).suggested)
+  assert.equal(R.closeRecall(id).ok, true)
+})
+
+test('联营退款补偿幂等：人工已先行退款后任务重试自动作废，不重复退款/红冲', async () => {
+  const COMP = await import('./compensation.js')
+  const m = P.listMaterials().find(x => x.name.includes('爆米花原料'))
+  const vid = m.vendors[0]?.id || db.prepare('SELECT id FROM vendors ORDER BY id LIMIT 1').get().id
+  linkOnly(vid, m.id)
+  const po = P.createOrder({ supplier_id: m.preferred_supplier_id, items: [{ material_id: m.id, qty: 10, unit_cost: m.std_cost || 6 }] })
+  P.submitOrder(po.id); P.approveOrder(po.id)
+  const itId = P.orderDetail(po.id).order.items[0].id
+  P.receiveOrder(po.id, [{ item_id: itId, qty: 10 }])
+  db.prepare(`INSERT INTO partner_contracts(application_id,vendor_id,commission_rate,member_discount_share,settle_period_days,deposit,start_day,status,sign_day,sign_tick)
+              VALUES(NULL,?,0.2,1,7,0,1,'active',1,0)`).run(vid)
+  P.applyVendorSales(vid, 3, { partner: true })
+  const r = R.createRecall({ supplier_id: m.preferred_supplier_id, material_id: m.id, reason: '人工先行测试', severity: 1 })
+  const id = r.id
+  R.acknowledgeVendor(id, vid)
+  const rvRow = R.recallDetail(id).recall.vendors.find(x => x.vendor_id === vid)
+  const v = db.prepare('SELECT price FROM vendors WHERE id=?').get(vid)
+  const cashBefore = cash()
+
+  // 挂载补偿任务后，人工先在业务侧完成退款（含红冲）
+  const q = COMP.enqueueDetached({
+    domain: 'partner', action: 'partner_recall_refund',
+    idemKey: `recall:${id}:rv:${rvRow.id}:qty:3`,
+    refType: 'recall_vendor', refId: rvRow.id, priority: 2,
+    payload: { recallId: id, recallVendorId: rvRow.id, vendorId: vid, qty: 3, isPartner: true }
+  })
+  const manual = R.vendorRefund(id, vid, 3)
+  assert.equal(manual.ok, true)
+  const cashAfterManual = cash()
+  assert.equal(cashAfterManual, cashBefore - 3 * v.price)
+
+  // 引擎重试：处理器发现可退数量不足（人工已退）→ obsolete，不重复退款/红冲
+  const stats = COMP.runCompensations()
+  assert.equal(stats.obsolete, 1)
+  assert.equal(cash(), cashAfterManual, '现金不得二次扣减')
+  // 仅统计本次召回本铺产生的红冲（全局红冲表含前序用例数据）
+  const redCount = db.prepare("SELECT COUNT(*) n FROM partner_sales WHERE kind='return' AND vendor_id=? AND complaint_id=?").get(vid, r.complaintId ?? R.recallDetail(id).recall.complaint_id).n
+  assert.equal(redCount, 1, '仅人工那一条红冲')
+  const t = db.prepare('SELECT status FROM compensation_tasks WHERE id=?').get(q.id)
+  assert.equal(t.status, 'obsolete')
+
+  const remain = R.recallDetail(id).recall.remain_quarantine
+  if (remain > 0) R.destroyBatches(id, remain)
+  R.payCompensation(id, R.compensationQuote(id).suggested)
+  R.closeRecall(id)
+})

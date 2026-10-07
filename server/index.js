@@ -89,6 +89,12 @@ import {
   closeRecall, closeFalseRecall, cancelRecall,
   listRecalls, recallDetail, recallStats
 } from './recalls.js'
+import {
+  initCompensationContext, runCompensations, retryTask as retryCompensationTask,
+  resolveTaskManual as resolveCompensationManual, markObsolete as markCompensationObsolete,
+  listCompensations, compensationDetail, compensationStats as compensationStatsFn
+} from './compensation.js'
+import { enqueueGroupOutageCompensations } from './groups.js'
 
 const app = express()
 app.use(express.json())
@@ -200,11 +206,20 @@ initGroupContext({
   logFinance,
   createComplaint: (payload) => createComplaint(payload)
 })
-// 预约停运联动 → 团行程重排/退款（同一事务内执行）
+// 预约停运联动 → 团行程重排/退款（同一事务内执行）；主事务异常回滚后团行程挂入统一补偿队列重试
 initReservationContext({
   handleParkOutageGroup: (rows, info) => handleParkOutageGroupRows(rows, info),
+  handleParkOutageGroupFailed: (rows, info) => enqueueGroupOutageCompensations(rows, info),
   // 全园封控（特别重大安全事件未复园）：新生成的未来入园时段默认关闭，防止封控期被下单
   isParkClosed: () => db.prepare("SELECT COUNT(*) n FROM incidents WHERE severity=4 AND status IN ('graded','contained','evacuating','controlled')").get().n > 0
+})
+
+// 统一可恢复补偿队列：设施停运后的预约退款 / 团队行程 / 联营（召回）退款统一排队重试，
+// 每个任务独立事务同步现金·库存·投诉·账单四个口径；处理器幂等，人工处理后不重复扣款/退款。
+initCompensationContext({
+  day: () => state.day(),
+  hour: () => state.hour(),
+  tick: () => state.tick()
 })
 
 // 统一客流预测与资源调度闭环：库存/团单在事务提交后刷新统一预测快照，并按动态模式触发调度重排
@@ -774,7 +789,22 @@ function tick() {
 
   // ---- 分时预约闭环 ----
   ensureSlots()                       // 维护未来三天的入园/设施时段库存
-  // 异常恢复必须先于爽约扫描：超售退款事务失败的挂起单先尝试补退，
+  // 统一可恢复补偿队列（必须最先执行）：停运后的预约退款 / 团队行程 / 联营退款逐任务独立事务重试，
+  // 成功才同步现金/库存/投诉/账单并释放名额；仍失败的保持挂起，不会被下面的爽约扫描误没收。
+  const compRecovered = runCompensations()
+  if (compRecovered.done > 0) {
+    console.log(`[compensation] 统一补偿恢复 ${compRecovered.done} 个任务（${compRecovered.qty} 人/份，现金 ¥${compRecovered.cash}）；失败 ${compRecovered.failed}、待人工 ${compRecovered.manual}、剩余 ${compRecovered.remaining}`)
+  }
+  if (compRecovered.manual > 0) {
+    const lastEvt = db.prepare("SELECT id FROM events WHERE type='compensation' AND day=? ORDER BY id DESC LIMIT 1").get(day)
+    if (!lastEvt) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(tickCount, day, 'compensation', '停运补偿多次失败 · 待人工核对',
+          `${compRecovered.manual} 个停运补偿任务（预约退款/团队行程/联营退款）自动重试多次未成功，已转入人工补偿队列。挂起期间预约保持待核销、不会按爽约没收，联营红冲不重复入账；请在「停运补偿」页核对现金/库存/账单后人工处理或再次重试。`,
+          -1, 'active')
+    }
+  }
+  // 异常恢复必须先于爽约扫描：超售退款事务失败的挂起单先尝试补退（内部驱动统一补偿队列），
   // 补退成功才释放名额/退现金，仍失败则保持 booked，且不会被下面的爽约扫描误没收
   const overbookRetry = retryPendingOverbookRefunds()
   if (overbookRetry.recovered > 0) {
@@ -1217,6 +1247,9 @@ app.get('/api/state', (req, res) => {
     // 供应商批次召回（供应商×园方×联营商户协同）
     recalls: listRecalls({ limit: 100 }),
     recallStats: recallStats(),
+    // 统一可恢复补偿队列（停运预约退款 / 团队行程 / 联营退款）
+    compensations: listCompensations({ limit: 120 }),
+    compensationStats: compensationStatsFn(),
     avgs: {
       satisfaction: computeSatisfaction(),
       openRatio: rides.length ? operatingRides().length / rides.length : 0
@@ -2013,6 +2046,49 @@ app.post('/api/reconcile/run', (req, res) => {
 // 忽略一条巡检告警（人工已核对/确认无需处理）
 app.post('/api/reconcile/:id/ignore', (req, res) => {
   res.json({ ...ignoreFinding(num(req.params.id)), reqId: req.reqId })
+})
+
+// ---- 统一可恢复补偿队列：停运后的预约退款 / 团队行程 / 联营退款 ----
+// 任务由停运联动/召回退款异常路径自动挂入，引擎每小时独立事务重试；
+// 人工可：立即重试 / 登记人工已处理（系统不再触达资金，防重复扣款退款）/ 核对后作废。
+app.get('/api/compensations', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listCompensations({
+      status: q.status || null,
+      domain: q.domain || null,
+      needsManual: q.needs_manual === '1' ? 1 : null,
+      limit: 300
+    }),
+    stats: compensationStatsFn()
+  })
+})
+
+app.get('/api/compensations/:id', (req, res) => {
+  const d = compensationDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '补偿任务不存在' })
+  res.json(d)
+})
+
+// 手动立即重试（现金/库存/投诉/账单在同一事务；幂等处理器保证不重复扣款/退款）
+app.post('/api/compensations/:id/retry', (req, res) => {
+  const b = req.body || {}
+  const r = retryCompensationTask(num(req.params.id), { staffId: num(b.staff_id) || null, note: b.note || '人工触发立即重试' })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 登记人工已处理：线下/业务侧已完成退款或账单红冲，系统停止自动重试（不再触碰现金/库存）
+app.post('/api/compensations/:id/manual', (req, res) => {
+  const b = req.body || {}
+  const r = resolveCompensationManual(num(req.params.id), { staffId: num(b.staff_id) || null, note: b.note || '' })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
+})
+
+// 人工核对确认业务已无需补偿（预约已他途核销/退款、联营红冲已在后续账单冲减）
+app.post('/api/compensations/:id/obsolete', (req, res) => {
+  const b = req.body || {}
+  const r = markCompensationObsolete(num(req.params.id), { staffId: num(b.staff_id) || null, note: b.note || '' })
+  res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----

@@ -1,5 +1,6 @@
 import db, { getSetting, setSetting, tx } from './db.js'
 import { markFlowDirty } from './flow.js'
+import { registerHandler, enqueueDetached, retryTask as runCompTaskById } from './compensation.js'
 
 // 分时预约模块：入园时段 9:00~18:00；设施时段 9:00~17:00（末班需留出运行时间）
 const OPEN_HOUR = 9
@@ -81,6 +82,8 @@ const ctx = {
   createComplaint: null,
   // 领队组团联动：设施停运/时段关闭时，source='group' 的在途预约交团模块重排或退款（同事务）
   handleParkOutageGroup: null,
+  // 停运联动主事务整体失败（异常回滚）后：团行程交团模块挂入统一补偿队列（独立持久化、可重试）
+  handleParkOutageGroupFailed: null,
   // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
   quoteReservation: null,
   onReservationBooked: null,
@@ -148,10 +151,12 @@ export function ensureSlots() {
 }
 
 // 设备状态变化时联动未来时段：停运则关闭时段并强制退款在途预约；恢复则重新开放
-// 关时段 + 批量退款 + 投诉在同一事务内提交，任一步失败整体回滚（不会时段关了款没退）
+// 关时段 + 批量退款 + 投诉在同一事务内提交，任一步失败整体回滚（不会时段关了款没退）。
+// 若因系统异常整体回滚（设施未停运、预约仍 booked），把在途预约统一挂入补偿队列：
+// 运营可重试停运操作；补偿队列处理器幂等，重复尝试不重复退款，人工先退款的任务自动作废。
 export function syncRideSlots(ride) {
   if (!ride) return
-  return runAtomic(() => {
+  const r = runAtomic(() => {
     if (ride.status === 'operating') {
       db.prepare(`UPDATE reservation_slots SET status='open' WHERE scope='ride' AND ride_id=? AND day>=?`)
         .run(ride.id, ctx.day())
@@ -171,15 +176,55 @@ export function syncRideSlots(ride) {
     forceRefundByPark(
       guestRows,
       `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
-      { title: `设施故障 · ${ride.name}`, skipComplaint: groupRows.length > 0 }
+      { title: `设施故障 · ${ride.name}`, skipComplaint: groupRows.length > 0, batchKey: `ride:${ride.id}:${ctx.tick()}` }
     )
     return { ok: true }
   })
+  // 系统异常整体回滚：把受影响预约与团队行程统一挂入可恢复补偿队列（独立持久化，不随回滚丢失）
+  if (!r.ok) attachOutageCompensations(ride, { scope: 'ride', r })
+  return r
 }
 
-// 园方原因强制全额退款（设备停运 / 超售无法改签）：款全额退回，生成投诉工单
-// 不自建事务：在调用方（syncRideSlots / updateSlot）的事务内逐单退款，
-// 任一单失败即抛出 → 外层整体回滚（不会时段关了款没退完 / 部分单半完成）
+// 停运联动失败后的统一补偿挂载（异常恢复层）：
+// 散客在途预约 → reservation/outage_refund；团队在途行程 → group/group_outage（团模块挂载）。
+// 处理器全部幂等：设施实际未停运时运营通常会重试停运（届时同事务成功补偿，任务作废或复用）；
+// 若运营先在业务侧逐单退款/改签，重试时任务识别终态自动 obsolete，绝不二次退款。
+function attachOutageCompensations(ride, info = {}) {
+  try {
+    const scope = info.scope || (ride ? 'ride' : 'entry')
+    const pendingAll = scope === 'ride'
+      ? db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
+                    AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`)
+        .all(ride.id, ctx.day(), ctx.day(), ctx.hour())
+      : db.prepare(`SELECT * FROM reservations WHERE scope='entry' AND status='booked'
+                    AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`)
+        .all(ctx.day(), ctx.day(), ctx.hour())
+    const groupRows = pendingAll.filter(r => r.source === 'group' && r.group_item_id)
+    const guestRows = pendingAll.filter(r => !(r.source === 'group' && r.group_item_id))
+    enqueueOutageCompensation(guestRows,
+      scope === 'ride'
+        ? `关联设施「${ride?.name || ''}」停运联动失败，补偿队列补退`
+        : '全园封控关停入园时段失败，补偿队列补退',
+      {
+        category: scope === 'ride' ? 'facility' : 'safety',
+        severity: scope === 'ride' ? 2 : 3,
+        title: scope === 'ride' ? `设施故障 · ${ride?.name || ''}` : '全园封控 · 入园预约取消',
+        content: scope === 'ride' ? '设施停运退款联动执行失败后由补偿队列补退，预约已全额退款。' : '全园封控入园退款联动失败后由补偿队列补退。',
+        batchKey: scope === 'ride' ? `ride:${ride.id}:${ctx.tick()}` : `entry:${ctx.tick()}`
+      })
+    if (groupRows.length && ctx.handleParkOutageGroupFailed) {
+      ctx.handleParkOutageGroupFailed(groupRows, { type: scope, ride: ride ? { id: ride.id, name: ride.name } : null, reason: info.reason || 'outage_failed' })
+    }
+  } catch (e) {
+    console.error('[reservations] 停运失败补偿挂载异常:', e)
+  }
+}
+
+// 园方原因强制全额退款（设备停运 / 全园封控）：款全额退回，生成投诉工单。
+// 不自建事务：在调用方（syncRideSlots / updateSlot / emergency）的事务内逐单退款，
+// 任一单失败即抛出 → 外层整体回滚（不会时段关了款没退完 / 部分单半完成）。
+// 外层捕获回滚后，统一补偿队列（enqueueOutageCompensation）承接未补偿预约，
+// 引擎每小时自动重试补退（现金/库存/投诉同事务），恢复后收敛，绝不重复退款。
 function forceRefundByPark(rows, note, complaintInfo = {}) {
   let n = 0
   for (const rsv of rows) {
@@ -199,6 +244,93 @@ function forceRefundByPark(rows, note, complaintInfo = {}) {
   }
   return n
 }
+
+// 停运主事务整体失败（系统异常已回滚）后：把未补偿的在途预约统一登记到补偿队列，
+// 独立事务持久化（不随失败回滚丢失）。引擎每小时（爽约扫描之前）重试补退：
+// 现金/库存/投诉在处理器内同事务完成；处理器幂等——预约已被人工或他途处置则作废，不二次退款。
+export function enqueueOutageCompensation(rows, note, complaintInfo = {}) {
+  if (!rows?.length) return 0
+  let qty = 0
+  const rideId = rows[0].ride_id ?? null
+  for (const rsv of rows) {
+    qty += rsv.qty
+    enqueueDetached({
+      domain: 'reservation',
+      action: 'outage_refund',
+      idemKey: `rsv:${rsv.id}:outage`,
+      refType: 'reservation',
+      refId: rsv.id,
+      priority: rsv.scope === 'entry' ? 1 : 3,
+      source: 'retry',
+      payload: {
+        reservationId: rsv.id, reason: 'park', note,
+        rideId: rsv.ride_id ?? rideId,
+        complaint: ctx.createComplaint ? {
+          category: complaintInfo.category || (rsv.ride_id ? 'facility' : 'service'),
+          severity: complaintInfo.severity || 2,
+          title: complaintInfo.title, content: complaintInfo.content,
+          batchKey: complaintInfo.batchKey || null   // 同批次只建一张投诉
+        } : null
+      },
+      note: `停运联动事务失败，统一补偿队列补退：${rsv.code}`
+    })
+  }
+  return qty
+}
+
+// ---------------- 统一补偿队列：散客预约退款处理器（停运补退 / 超售补退） ----------------
+// 处理器幂等：先复核预约真实状态——
+//   已退款（refunded/refunded_half）→ 直接返回成功结果（不重复退现金/不重复释放库存）；
+//   已核销/爽约等非 booked 终态 → obsolete，交队列作废（人工已处理，绝不二次退款）；
+//   booked → 在处理器事务内退款（现金+库存+会员权益+流水+日志），投诉按批次幂等补建。
+function compensationRefund(task) {
+  const rsv = getReservation(task.payload.reservationId)
+  if (!rsv) return { obsolete: true, note: '预约已不存在' }
+  if (rsv.status === 'refunded' || rsv.status === 'refunded_half') {
+    return { obsolete: false, qty: rsv.qty, cash: rsv.refund_amount, dup: true, note: `预约 ${rsv.code} 已退款，幂等跳过资金动作` }
+  }
+  if (rsv.status !== 'booked') {
+    return { obsolete: true, note: `预约 ${rsv.code} 已按「${STATUS_NAMES[rsv.status] || rsv.status}」处理，补退作废` }
+  }
+  const reason = task.action === 'overbook_refund' ? 'overbook' : (task.payload.reason || 'park')
+  const note = task.payload.note || (reason === 'overbook'
+    ? '本场超售且无后续时段可改签，全额退款（统一补偿队列重试补退）'
+    : '设施停运/封控，园方强制退款（统一补偿队列重试补退）')
+  const r = refundOne(rsv, reason, note, { fromPendingRetry: true, skipComplaint: true })
+  // 投诉按批次幂等补建：同一停运批次（batchKey）只建一张，跨任务/跨重试/跨重启由去重表保证；
+  // 无 batchKey 的任务（如超售补退）各自建一张。建投诉与退款在同一事务，失败一起重试。
+  let complaintCode = ''
+  const cSpec = task.payload.complaint
+  if (cSpec && ctx.createComplaint) {
+    const key = cSpec.batchKey || `task:${task.id}`
+    const existed = db.prepare('SELECT complaint_id FROM compensation_complaint_batches WHERE batch_key=?').get(key)
+    if (existed) {
+      complaintCode = 'TS' + String(existed.complaint_id).padStart(4, '0')
+    } else {
+      const c = ctx.createComplaint({
+        category: cSpec.category || (rsv.ride_id ? 'facility' : 'service'),
+        severity: cSpec.severity || 2,
+        title: cSpec.title || `设施停运补偿 · ${db.prepare('SELECT name FROM rides WHERE id=?').get(rsv.ride_id)?.name || '园区'}`,
+        content: cSpec.content || '园方原因取消预约，虽已全额退款但行程受影响，游客要求说法。',
+        target: rsv.ride_id ? { type: 'ride', id: rsv.ride_id, name: db.prepare('SELECT name FROM rides WHERE id=?').get(rsv.ride_id)?.name || '' } : { type: '', id: null, name: '' },
+        source: 'guest'
+      })
+      db.prepare('INSERT OR IGNORE INTO compensation_complaint_batches(batch_key,complaint_id,domain,created_tick,created_day) VALUES(?,?,?,?,?)')
+        .run(key, c?.id ?? 0, 'reservation', ctx.tick(), ctx.day())
+      complaintCode = c?.code || ''
+    }
+  }
+  return { ok: true, qty: rsv.qty, cash: r.back, stock: `${rsv.scope} 名额 +${rsv.qty}`, complaint: complaintCode || '沿用批次投诉', bill: reason === 'overbook' ? '超售全额退款已入财务流水' : '园方停运退款已入财务流水' }
+}
+registerHandler('reservation', compensationRefund)
+
+// 预约是否存在统一补偿队列中的未终结任务（停运补退/超售补退），爽约扫描据此排除
+function hasOpenCompensation(rid) {
+  return !!db.prepare("SELECT 1 FROM compensation_tasks WHERE ref_type='reservation' AND ref_id=? AND status IN ('pending','processing') LIMIT 1").get(rid)
+}
+
+// 团队行程模块查询复用：某团行程关联预约是否有未终结补偿（停运团款重试期间不得按爽约没收）
+export function reservationHasOpenCompensation(rid) { return hasOpenCompensation(rid) }
 
 // ---------------- 下单 / 改签 / 退款 ----------------
 // 核心一致性：建单+扣库存+预收款+流水+日志在同一事务提交；库存用条件更新原子扣减，
@@ -407,6 +539,8 @@ function moveToSlot(rsv, alt) {
 
 // ---------------- 超售安置与异常补偿队列 ----------------
 // 超售退款事务失败后持久化挂起（独立事务提交，保证不随失败回滚丢失）。
+// 同时写入「统一补偿队列」(compensation_tasks)：超售补退与停运补退/团队/联营补偿
+// 走同一套重试、人工处理与防重口径；旧表 reservation_pending_actions 保留兼容既有观察面。
 // 引擎每小时（爽约扫描之前）重试补退；挂起期间保留 booked，避免被误按爽约没收。
 function enqueueOverbookRefund(rsv, lastError = '') {
   runAtomic(() => {
@@ -420,6 +554,27 @@ function enqueueOverbookRefund(rsv, lastError = '') {
     logReservation(rsv.id, 'overbook_pending',
       `本场超售且退款事务失败（${lastError || 'TX_FAILED'}），预约保持待核销，已挂起等待自动补退`)
     return { ok: true }
+  })
+  // 统一补偿队列（独立持久化，幂等键防止重复挂起）；失败不影响旧表挂起，两套队列各自兜底
+  enqueueDetached({
+    domain: 'reservation',
+    action: 'overbook_refund',
+    idemKey: `rsv:${rsv.id}:overbook`,
+    refType: 'reservation',
+    refId: rsv.id,
+    priority: 2,
+    source: 'auto',
+    payload: {
+      reservationId: rsv.id, reason: 'overbook',
+      note: '本场超售且无后续时段可改签，全额退款',
+      rideId: rsv.ride_id ?? null,
+      complaint: {
+        category: rsv.scope === 'entry' ? 'queue' : 'facility', severity: 2,
+        title: `超售补偿 · ${rsv.ride_id ? db.prepare('SELECT name FROM rides WHERE id=?').get(rsv.ride_id)?.name || '设施' : '分时入园'}`,
+        content: `预约 ${rsv.code} 到场时名额已满（超售无法改签），已全额退款，游客不满要求补偿。`
+      }
+    },
+    note: `超售退款事务失败，统一补偿队列补退：${rsv.code}`
   })
 }
 
@@ -448,45 +603,67 @@ function settleOverbook(rsv) {
 }
 
 // 重试挂起的超售补退（引擎每小时在爽约扫描之前调用，也可在核销整点前调用）。
-// 逐单独立事务，一单失败不影响其余；预约已被他途核销/改签/退款/爽约则置 obsolete，不再补退。
+// 统一由「补偿队列」驱动（compensation_tasks），旧表 reservation_pending_actions 仅同步状态做兼容观察面：
+//   逐任务独立事务，一单失败不影响其余；预约已被他途核销/改签/退款/爽约则处理器置 obsolete，不再补退。
 // 返回 { recovered 已补退单数, qty 已补退人数, amount 已补退金额, failed 本轮仍失败单数, remaining 剩余挂起单数 }
 export function retryPendingOverbookRefunds() {
   const rows = db.prepare("SELECT * FROM reservation_pending_actions WHERE status='pending' ORDER BY id").all()
   let recovered = 0, qty = 0, amount = 0, failed = 0
   for (const p of rows) {
     const rsv = getReservation(p.reservation_id)
+    // 统一补偿队列中的同幂等键任务（双写时创建）；若历史旧表记录没有对应任务则补挂一条
+    let task = db.prepare("SELECT * FROM compensation_tasks WHERE idem_key=? AND status IN ('pending','processing')")
+      .get(`rsv:${p.reservation_id}:overbook`)
     if (!rsv || rsv.status !== 'booked') {
-      // 已被其他流程处理（人工核销/改签/退款/爽约）：挂起动作作废，避免二次退款
+      // 已被其他流程处理（人工核销/改签/退款/爽约）：旧挂起与统一任务一并作废，避免二次退款
       runAtomic(() => {
         db.prepare("UPDATE reservation_pending_actions SET status='obsolete', updated_tick=? WHERE id=? AND status='pending'")
           .run(ctx.tick(), p.id)
+        if (task) db.prepare("UPDATE compensation_tasks SET status='obsolete', finished_tick=?, finished_day=?, updated_tick=? WHERE id=? AND status IN ('pending','processing')")
+          .run(ctx.tick(), ctx.day(), ctx.tick(), task.id)
         if (rsv) logReservation(rsv.id, 'overbook_pending', `预约已按「${STATUS_NAMES[rsv.status] || rsv.status}」处理，挂起补退自动作废`)
         return { ok: true }
       })
       continue
     }
-    const r = refundReservation(rsv, 'overbook', '本场超售且无后续时段可改签，全额退款（异常重试补退）', { fromPendingRetry: true })
-    if (r.ok) {
+    if (!task) {
+      // 兼容补偿队列表建立前产生的旧挂起：按同口径补挂统一任务
+      enqueueDetached({
+        domain: 'reservation', action: 'overbook_refund',
+        idemKey: `rsv:${rsv.id}:overbook`, refType: 'reservation', refId: rsv.id, priority: 2, source: 'retry',
+        payload: { reservationId: rsv.id, reason: 'overbook', note: '本场超售且无后续时段可改签，全额退款（旧挂起补挂统一队列）', rideId: rsv.ride_id ?? null },
+        note: `旧超售挂起 #${p.id} 补挂统一补偿队列`
+      })
+      task = db.prepare("SELECT * FROM compensation_tasks WHERE idem_key=? AND status IN ('pending','processing')")
+        .get(`rsv:${rsv.id}:overbook`)
+    }
+    const before = rsv.status
+    const r = runCompTaskById(task.id)
+    const after = getReservation(rsv.id)
+    if (r?.ok || after.status === 'refunded') {
       runAtomic(() => {
         db.prepare("UPDATE reservation_pending_actions SET status='done', attempts=attempts+1, last_error='', updated_tick=? WHERE id=? AND status='pending'")
           .run(ctx.tick(), p.id)
         return { ok: true }
       })
-      recovered++
-      qty += rsv.qty
-      amount += r.back || 0
-    } else if (r.code === RSV_ERR.STATUS_CONFLICT || r.code === RSV_ERR.NOT_FOUND) {
+      if (before === 'booked' && after.status === 'refunded') {
+        recovered++
+        qty += after.qty
+        amount += after.refund_amount || 0
+      }
+    } else if (after.status !== 'booked') {
       runAtomic(() => {
         db.prepare("UPDATE reservation_pending_actions SET status='obsolete', updated_tick=? WHERE id=? AND status='pending'")
           .run(ctx.tick(), p.id)
         return { ok: true }
       })
     } else {
-      // 仍为系统异常：递增尝试次数并留痕，下一小时继续补退（未成功前预约保持 booked、不会进爽约）
-      db.prepare("UPDATE reservation_pending_actions SET attempts=attempts+1, last_error=?, updated_tick=? WHERE id=? AND status='pending'")
-        .run(`${r.code || 'TX_FAILED'} ${r.msg || ''}`.trim().slice(0, 300), ctx.tick(), p.id)
+      // 仍为系统异常：旧表尝试次数与错误随统一任务同步，下一小时继续补退（未成功前预约保持 booked、不会进爽约）
+      const t2 = db.prepare('SELECT attempts,last_error FROM compensation_tasks WHERE id=?').get(task.id)
+      db.prepare("UPDATE reservation_pending_actions SET attempts=?, last_error=?, updated_tick=? WHERE id=? AND status='pending'")
+        .run(t2?.attempts ?? p.attempts + 1, String(t2?.last_error || 'TX_FAILED').slice(0, 300), ctx.tick(), p.id)
       failed++
-      console.error(`[reservations] 超售补退重试仍失败，预约 #${rsv.id} 保持挂起（第 ${p.attempts + 1} 次）:`, r.code)
+      console.error(`[reservations] 超售补退重试仍失败，预约 #${rsv.id} 保持挂起（第 ${(t2?.attempts ?? p.attempts) + 1} 次）`)
     }
   }
   const remaining = db.prepare("SELECT COUNT(*) n FROM reservation_pending_actions WHERE status='pending'").get().n
@@ -615,8 +792,9 @@ function findAlternativeSlots(rsv) {
 
 // 爽约：所有已过时段未核销的预约（含跨天兜底）标记 noshow，预收款没收（记入「违约」），释放爽约计数
 // 整批一个事务；状态条件更新保证与退款/核销并发时不会重复没收。
-// 关键排除：存在 pending 超售补退（reservation_pending_actions）的预约是园方超售、退款事务失败的待补偿单，
-// 绝不能按爽约没收预收款（否则欠款变违约金、经营数据虚报）；它们保持 booked，由 retryPendingOverbookRefunds 补退。
+// 关键排除：存在待执行补偿任务（统一补偿队列 compensation_tasks：超售补退/停运补退，
+// 含旧表 reservation_pending_actions）的预约是园方欠退款的待补偿单，
+// 绝不能按爽约没收预收款（否则欠款变违约金、经营数据虚报）；它们保持 booked，由补偿队列补退。
 export function expireNoShow(hour) {
   const day = ctx.day()
   // 领队团预约由组团模块统一核销（款项走团账），散客爽约批处理不触达
@@ -627,6 +805,11 @@ export function expireNoShow(hour) {
                           AND NOT EXISTS (
                             SELECT 1 FROM reservation_pending_actions p
                             WHERE p.reservation_id=r.id AND p.status='pending'
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM compensation_tasks ct
+                            WHERE ct.ref_type='reservation' AND ct.ref_id=r.id
+                              AND ct.status IN ('pending','processing')
                           )`).all(day, day, hour)
   let qty = 0
   runAtomic(() => {
@@ -739,7 +922,7 @@ export function updateSlot(id, patch) {
   }
   if (!sets.length) return fail(RSV_ERR.STATUS_CONFLICT, '无更新项')
 
-  return runAtomic(() => {
+  const r = runAtomic(() => {
     if (patch.status === 'closed') {
       // 关闭时段：在途预约园方全额退款并生成投诉
       const pendingAll = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
@@ -757,13 +940,28 @@ export function updateSlot(id, patch) {
       if (pending.length) {
         const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
         forceRefundByPark(pending, `运营关闭 ${s.day}日 ${s.hour}:00 时段，园方强制退款`,
-          { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service', skipComplaint: groupRows.length > 0 })
+          { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service', skipComplaint: groupRows.length > 0, batchKey: `slot:${id}:${ctx.tick()}` })
       }
     }
     vals.push(id)
     db.prepare(`UPDATE reservation_slots SET ${sets.join(',')} WHERE id=?`).run(...vals)
     return { ok: true }
   })
+  // 系统异常整体回滚：受影响预约挂入统一补偿队列，恢复后自动补退（幂等，不二次退款）
+  if (!r.ok) {
+    try {
+      const pendingAll = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
+      const groupRows = pendingAll.filter(x => x.source === 'group' && x.group_item_id)
+      const guestRows = pendingAll.filter(x => !(x.source === 'group' && x.group_item_id))
+      const ride = s.scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(s.ride_id) : null
+      enqueueOutageCompensation(guestRows, `运营关闭 ${s.day}日 ${s.hour}:00 时段联动失败，补偿队列补退`,
+        { category: ride ? 'facility' : 'service', severity: 2, title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, batchKey: `slot:${id}:${ctx.tick()}` })
+      if (groupRows.length && ctx.handleParkOutageGroupFailed) {
+        ctx.handleParkOutageGroupFailed(groupRows, { type: s.scope, ride: ride || null, reason: 'slot_closed_failed' })
+      }
+    } catch (e) { console.error('[reservations] 关时段失败补偿挂载异常:', e) }
+  }
+  return r
 }
 
 export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null, includeGroup = false } = {}) {
@@ -903,6 +1101,7 @@ export const RESERVATION_CONST = { OPEN_HOUR, ENTRY_HOURS, RIDE_HOURS, GENERATE_
 // 全园封控（特别重大安全事件）：关停全部未来入园时段，在途入园预约园方全额退款；
 // 团入园行程交团模块同事务重排/退款，散客预约自动生成投诉。返回退款人数。
 // 不自建事务：在调用方（应急模块封控事务）内执行，任一步失败抛错由外层整体回滚。
+// 应急模块捕获回滚后调用 attachEntryOutageCompensation 把未补偿预约挂入统一补偿队列。
 export function emergencyCloseEntrySlots(note = '园区安全事件，全园临时封控') {
   db.prepare("UPDATE reservation_slots SET status='closed' WHERE scope='entry' AND day>=?")
     .run(ctx.day())
@@ -923,7 +1122,8 @@ export function emergencyCloseEntrySlots(note = '园区安全事件，全园临�
       severity: 3,
       title: '全园封控 · 入园预约取消',
       content: '园区因安全事件临时封控，您的入园预约已被园方取消，虽已全额退款，但行程受到影响。',
-      skipComplaint: groupRows.length > 0
+      skipComplaint: groupRows.length > 0,
+      batchKey: `entry:${ctx.tick()}`
     }
   )
   for (const r of guestRows) qty += r.qty

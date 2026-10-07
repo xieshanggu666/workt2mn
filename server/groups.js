@@ -1,9 +1,10 @@
 import db, { getSetting, setSetting, tx } from './db.js'
 import {
   RESERVATION_CONST, ensureSlots,
-  getSlotById, findGroupAltSlots
+  getSlotById, findGroupAltSlots, reservationHasOpenCompensation
 } from './reservations.js'
 import { markFlowDirty } from './flow.js'
+import { registerHandler, enqueueDetached } from './compensation.js'
 
 // 领队组团模块：领队提交入园 + 多设施行程 → 运营确认统一锁定名额并收订金
 // → 分批核销 / 尾款结算 / 部分退团 → 设施停运时重排行程或退款，回写预约、客流与财务。
@@ -476,6 +477,37 @@ export function refundGroupLeg(itemId, qty, { requestId = '' } = {}) {
   })
 }
 
+// 单团行程停运处置（不包事务，在调用方事务/补偿处理器内执行）：
+// 能自动重排则原子转移，不能则入园直接退、设施挂起待运营/领队决策。
+// 返回 { interrupted, autoRefunded, rerouted }；幂等：非 active/rerouted 行程直接跳过。
+function processOutageItem(g, rsv, item, info = {}) {
+  let interrupted = 0, autoRefunded = 0, rerouted = 0
+  if (!item || !['active', 'rerouted'].includes(item.status)) return { interrupted, autoRefunded, rerouted }
+  const rideName = info.ride?.name || ''
+  const remain = item.qty - item.checked_qty - item.refunded_qty
+  if (remain <= 0) return { interrupted, autoRefunded, rerouted }
+  const alts = findGroupAltSlots({
+    kind: item.kind, rideId: item.ride_id, excludeRideId: item.ride_id,
+    day: item.slot_day, hour: item.slot_hour, qty: remain
+  })
+  const alt = alts[0]
+  if (alt) {
+    rerouteToSlot(g, item, alt, remain,
+      `关联设施「${rideName}」停运，系统自动重排至 ${alt.day}日 ${alt.hour}:00`, { releaseOld: true })
+    rerouted = remain
+  } else if (item.kind === 'entry') {
+    // 入园时段无法安置：该程园方全额回退团款（否则团队无法入园）
+    sliceItemRefund(item, remain, 'park', '入园时段关闭且无可改时段，园方全额回退团款')
+    autoRefunded = remain
+  } else {
+    // 设施无法立即重排：释放名额并挂起，领队/运营随后选择重排其他设施或退款
+    suspendInterruptedItem(g, item, rsv, remain,
+      `设施「${rideName || '停运'}」，第 ${item.slot_day} 天 ${item.slot_hour}:00 行程暂停，等待重排或退款`)
+    interrupted = remain
+  }
+  return { interrupted, autoRefunded, rerouted }
+}
+
 // ---------------- 设施停运：重排行程或退款（在散客模块同事务内调用，不自建事务） ----------------
 // rows: source='group' 的在途预约；逐团处理：能自动重排则原子转移，不能则入园直接退、设施挂起待运营/领队决策
 export function handleParkOutageGroupRows(rows, info = {}) {
@@ -491,46 +523,120 @@ export function handleParkOutageGroupRows(rows, info = {}) {
     const g = getGroup(gid)
     if (!g) continue
     let interrupted = 0, autoRefunded = 0, rerouted = 0
-    const rideName = info.ride?.name || ''
     for (const { rsv, item } of list) {
-      const remain = item.qty - item.checked_qty - item.refunded_qty
-      if (remain <= 0) continue
-      const alts = findGroupAltSlots({
-        kind: item.kind, rideId: item.ride_id, excludeRideId: item.ride_id,
-        day: item.slot_day, hour: item.slot_hour, qty: remain
-      })
-      const alt = alts[0]
-      if (alt) {
-        rerouteToSlot(g, item, alt, remain,
-          `关联设施「${rideName}」停运，系统自动重排至 ${alt.day}日 ${alt.hour}:00`, { releaseOld: true })
-        rerouted += remain
-      } else if (item.kind === 'entry') {
-        // 入园时段无法安置：该程园方全额回退团款（否则团队无法入园）
-        sliceItemRefund(item, remain, 'park', '入园时段关闭且无可改时段，园方全额回退团款')
-        autoRefunded += remain
-      } else {
-        // 设施无法立即重排：释放名额并挂起，领队/运营随后选择重排其他设施或退款
-        suspendInterruptedItem(g, item, rsv, remain,
-          `设施「${rideName || '停运'}」，第 ${item.slot_day} 天 ${item.slot_hour}:00 行程暂停，等待重排或退款`)
-        interrupted += remain
-      }
+      const out = processOutageItem(g, rsv, item, info)
+      interrupted += out.interrupted; autoRefunded += out.autoRefunded; rerouted += out.rerouted
     }
     if (rerouted + interrupted + autoRefunded > 0) {
       affectedGroups.push({ g, interrupted, rerouted, autoRefunded })
-      logGroup(gid, 'outage',
-        `设施停运联动：自动重排 ${rerouted} 人${autoRefunded ? `，入园回退 ${autoRefunded} 人` : ''}${interrupted ? `，${interrupted} 人行程挂起待重排/退款` : ''}`)
-      // 一团一投诉（园方原因，团队行程受影响）
-      ctx.createComplaint?.({
-        category: 'facility', severity: 2,
-        title: `团队行程变更 · ${rideName || '设施停运'} · ${g.code}`,
-        content: `领队 ${g.leader_name} 的 ${g.qty} 人团队行程受设施停运影响：重排 ${rerouted} 人、待处置 ${interrupted} 人、退款 ${autoRefunded} 人，领队要求园方给出说法。`,
-        target: info.ride ? { type: 'ride', id: info.ride.id, name: rideName } : { type: '', id: null, name: '' },
-        source: 'guest'
-      })
+      logOutageComplaint(g, info, { interrupted, rerouted, autoRefunded })
     }
   }
   return { ok: true, affected: affectedGroups.length }
 }
+
+// 停运联动主事务整体失败（异常回滚）后：把受影响团行程统一挂入补偿队列（独立持久化，可重试）。
+// 每团一条任务，处理器幂等——重试时只处置仍为 active/rerouted 的行程；
+// 人工已重排/退款/核销的行程自动跳过，绝不重复退团款。
+export function enqueueGroupOutageCompensations(rows, info = {}) {
+  const byGroup = new Map()
+  for (const r of rows) {
+    const item = db.prepare('SELECT * FROM group_items WHERE id=?').get(r.group_item_id)
+    if (!item || !['active', 'rerouted'].includes(item.status)) continue
+    if (!byGroup.has(item.group_id)) byGroup.set(item.group_id, [])
+    byGroup.get(item.group_id).push({ reservationId: r.id, itemId: item.id })
+  }
+  let n = 0
+  for (const [gid, list] of byGroup) {
+    const g = getGroup(gid)
+    if (!g) continue
+    enqueueDetached({
+      domain: 'group',
+      action: 'group_outage',
+      // 幂等键不含 tick：同一批团行程在多次停运联动失败/重试中只挂一条任务
+      idemKey: `group:${gid}:outage:${list.map(x => x.itemId).sort().join('-')}`,
+      refType: 'group',
+      refId: gid,
+      priority: info.type === 'entry' ? 1 : 3,
+      source: 'retry',
+      payload: {
+        groupId: gid,
+        items: list,
+        info: { type: info.type || 'ride', rideId: info.ride?.id ?? null, rideName: info.ride?.name || '', reason: info.reason || 'outage_failed' }
+      },
+      note: `停运联动事务失败，团队 ${g.code} 行程补偿挂起`
+    })
+    n++
+  }
+  return n
+}
+
+function logOutageComplaint(g, info, counts) {
+  const rideName = info.ride?.name || ''
+  logGroup(g.id, 'outage',
+    `设施停运联动：自动重排 ${counts.rerouted} 人${counts.autoRefunded ? `，入园回退 ${counts.autoRefunded} 人` : ''}${counts.interrupted ? `，${counts.interrupted} 人行程挂起待重排/退款` : ''}`)
+  // 一团一投诉（园方原因，团队行程受影响）
+  const c = ctx.createComplaint?.({
+    category: 'facility', severity: 2,
+    title: `团队行程变更 · ${rideName || '设施停运'} · ${g.code}`,
+    content: `领队 ${g.leader_name} 的 ${g.qty} 人团队行程受设施停运影响：重排 ${counts.rerouted} 人、待处置 ${counts.interrupted} 人、退款 ${counts.autoRefunded} 人，领队要求园方给出说法。`,
+    target: info.ride ? { type: 'ride', id: info.ride.id, name: rideName } : { type: '', id: null, name: '' },
+    source: 'guest'
+  })
+  return c?.code || ''
+}
+
+// ---------------- 统一补偿队列：团队行程处理器 ----------------
+// 幂等：逐行程复核状态，仅 active/rerouted 且有待安置人员才执行；
+// 人工已重排（rerouted 到别处后再次停运的旧单）/退款/核销/爽约的行程自动跳过，不重复退团款。
+registerHandler('group', (task) => {
+  if (task.action !== 'group_outage') throw new Error(`UNSUPPORTED_GROUP_ACTION:${task.action}`)
+  const { groupId, items = [], info = {} } = task.payload
+  const g = getGroup(groupId)
+  if (!g) return { obsolete: true, note: '团单已不存在' }
+  if (!['confirmed', 'settled'].includes(g.status) && g.status !== 'completed') {
+    // 团单已结案/取消：未处置行程也无款可退（走各自结案流程），任务作废
+    if (['cancelled', 'rejected', 'closed_noshow'].includes(g.status)) return { obsolete: true, note: `团单已「${g.status}」，补偿作废` }
+  }
+  let interrupted = 0, autoRefunded = 0, rerouted = 0, cash = 0
+  let acted = 0
+  for (const x of items) {
+    const item = getItem(x.itemId)
+    if (!item) continue
+    if (!['active', 'rerouted'].includes(item.status)) continue   // 人工已处置/已挂起/已退：跳过
+    const remain = item.qty - item.checked_qty - item.refunded_qty
+    if (remain <= 0) continue
+    const rsv = x.reservationId ? db.prepare('SELECT * FROM reservations WHERE id=?').get(x.reservationId) : null
+    const before = g.refunded_amount
+    const out = processOutageItem(g, rsv || { id: item.reservation_id }, item, info)
+    const ng = getGroup(groupId)
+    cash += Math.max(0, ng.refunded_amount - before)
+    interrupted += out.interrupted; autoRefunded += out.autoRefunded; rerouted += out.rerouted
+    acted++
+  }
+  if (acted === 0) return { obsolete: true, note: '团队行程均已被处置（重排/退款/核销），补偿自动作废' }
+  // 投诉幂等：同一补偿任务只建一张（重试时沿用）；批次表持久化，跨重启不重复建单
+  const batchKey = `group-task:${task.id}`
+  const existed = db.prepare('SELECT complaint_id FROM compensation_complaint_batches WHERE batch_key=?').get(batchKey)
+  let complaintCode = ''
+  if (existed) {
+    complaintCode = 'TS' + String(existed.complaint_id).padStart(4, '0')
+  } else {
+    complaintCode = logOutageComplaint(getGroup(groupId), info, { interrupted, rerouted, autoRefunded })
+    const cid = complaintCode ? Number(String(complaintCode).replace(/\D/g, '')) : 0
+    db.prepare('INSERT OR IGNORE INTO compensation_complaint_batches(batch_key,complaint_id,domain,created_tick,created_day) VALUES(?,?,?,?,?)')
+      .run(batchKey, cid, 'group', ctx.tick(), ctx.day())
+  }
+  return {
+    ok: true,
+    qty: interrupted + autoRefunded + rerouted,
+    cash,
+    stock: `团队名额：重排 ${rerouted} / 退款释放 ${autoRefunded} / 挂起释放 ${interrupted}`,
+    complaint: complaintCode ? `团队行程变更投诉 ${complaintCode}` : '沿用已登记投诉',
+    bill: cash > 0 ? '团款回退已逐笔入团账与财务流水' : '无现金团款回退（挂起待领队决策）',
+    note: `重排 ${rerouted} 人、挂起 ${interrupted} 人、退团款 ${autoRefunded} 人`
+  }
+})
 
 // 行程挂起：释放关闭时段名额，关联 0 元预约置园方退款态（团款暂留团账，待重排/退款决策）
 function suspendInterruptedItem(g, item, rsv, remain, note) {
@@ -741,6 +847,11 @@ export function autoGroupTick() {
   return { entry: entry.qty, rides }
 }
 
+// 团单是否存在统一补偿队列中的未终结任务（停运团款重试期间整团不进爽约结案）
+function groupHasOpenCompensation(gid) {
+  return !!db.prepare("SELECT 1 FROM compensation_tasks WHERE ref_type='group' AND ref_id=? AND status IN ('pending','processing') LIMIT 1").get(gid)
+}
+
 // 爽约结案：在途未核销行程按已付比例没收（违约收入）；停运挂起行程园方退回；名额转 noshow
 export function expireGroupNoShow() {
   const rows = db.prepare("SELECT * FROM group_orders WHERE status IN ('confirmed','settled') AND visit_day<?").all(ctx.day())
@@ -751,6 +862,9 @@ export function expireGroupNoShow() {
       for (const item of items) {
         const remain = item.qty - item.checked_qty - item.refunded_qty
         if (remain <= 0) continue
+        // 统一补偿队列中存在未终结任务的团行程（停运补偿重试中）：保持挂起，绝不按爽约没收团款
+        if (item.reservation_id && reservationHasOpenCompensation(item.reservation_id)) continue
+        if (groupHasOpenCompensation(g.id)) continue
         if (item.status === 'interrupted') {
           // 园方停运且一直未安排：直接按园方原因退回已付部分（旧名额已在挂起时释放，不再动库存）
           const r0 = refundInterruptedItem(item.id, { requestId: `auto-grp-intrefund-${item.id}` })

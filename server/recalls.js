@@ -3,6 +3,7 @@ import {
   quarantineBatch, releaseBatchQuarantine, recallQuarantinedBatches,
   returnQuarantinedToSupplier, destroyQuarantinedBatches, vendorMaterialNetSold
 } from './procurement.js'
+import { registerHandler, enqueueDetached } from './compensation.js'
 
 // 供应商批次召回模块：供应商 / 园方 / 联营商户 三方协同闭环
 //   发起召回（隔离在库批次·停售·通知受影响商铺·餐饮质量投诉·事件通知）
@@ -180,26 +181,51 @@ export function acknowledgeVendor(recallId, vendorId, { note = '' } = {}) {
   }
 }
 
-// 游客退货退款（按商铺）：召回商品不退库（问题品由游客处置），自营退现金，联营红冲分账
+// 游客退货退款（按商铺）：召回商品不退库（问题品由游客处置），自营退现金，联营红冲分账。
+// 现金/库存留痕/红冲/单据回写同事务；系统异常整体回滚后，统一补偿队列承接重试
+//（幂等：以 recall_vendor 已退款数量为准，不重复退现金、不重复红冲账单）。
 export function vendorRefund(recallId, vendorId, qty, { note = '', staffId = null } = {}) {
   const r = getRecall(recallId)
   if (!r) return { ok: false, code: 'NOT_FOUND', msg: '召回单不存在' }
   if (!OPEN_STATUS.includes(r.status)) return { ok: false, code: 'BAD_STATUS', msg: '召回单已结案，不能再登记退款' }
-  const rv = db.prepare('SELECT * FROM recall_vendors WHERE recall_id=? AND vendor_id=?').get(r.id, num(vendorId))
-  if (!rv) return { ok: false, code: 'NOT_FOUND', msg: '该商铺不在本次召回影响范围内' }
+  const rv0 = db.prepare('SELECT * FROM recall_vendors WHERE recall_id=? AND vendor_id=?').get(r.id, num(vendorId))
+  if (!rv0) return { ok: false, code: 'NOT_FOUND', msg: '该商铺不在本次召回影响范围内' }
   const q = Math.max(1, Math.round(num(qty)))
-  if (q > rv.sold_qty - rv.refund_qty + 0.0001) {
-    return { ok: false, code: 'QTY_EXCEED', msg: `退款数量不能超过该铺待召回净售出 ${round1(rv.sold_qty - rv.refund_qty)}` }
+  if (q > rv0.sold_qty - rv0.refund_qty + 0.0001) {
+    return { ok: false, code: 'QTY_EXCEED', msg: `退款数量不能超过该铺待召回净售出 ${round1(rv0.sold_qty - rv0.refund_qty)}` }
   }
-  const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(rv.vendor_id)
+  const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(rv0.vendor_id)
   const material = getMaterial(r.material_id)
   const refund = Math.round(q * (v?.price || 0))
   if (refund <= 0) return { ok: false, code: 'BAD_ARG', msg: '该商铺售价为 0，无法计算退款金额' }
+  const res = applyVendorRefundTx({ recallId: r.id, rv: rv0, q, refund, note, staffId })
+  if (res.ok) return res
+  // 系统异常（事务已回滚，无资金/库存/红冲副作用）：统一补偿队列挂起重试，不虚报成功
+  if (res.code === 'TX_FAILED' || res.code === 'PARTNER_RETURN_FAILED') {
+    enqueuePartnerRecallRefund({ recallId: r.id, rvId: rv0.id, vendorId: rv0.vendor_id, qty: q, isPartner: !!rv0.is_partner, reason: res.code })
+    return { ok: false, code: 'QUEUED_COMPENSATION', queued: true, msg: '退款处理失败（本次未生效），已进入统一补偿队列自动重试，不会重复扣款/退款' }
+  }
+  return res
+}
+
+// 退款事务本体（可被补偿处理器复用，必须幂等）：
+// 以 recall_vendors.refund_qty 的条件增量更新作为“是否已退”的唯一防线——
+// 重试/人工已退导致可退数量不足时整体回滚并由处理器判定 obsolete，绝不重复退款/重复红冲。
+function applyVendorRefundTx({ recallId, rv, q, refund, note = '', staffId = null }) {
   try {
     return tx(() => {
-      if (rv.is_partner) {
+      const r = getRecall(recallId)
+      const rvRow = db.prepare('SELECT * FROM recall_vendors WHERE id=?').get(rv.id)
+      if (!r || !rvRow) throw new RecallError('NOT_FOUND', '召回单或商铺记录不存在')
+      if (!OPEN_STATUS.includes(r.status)) throw new RecallError('BAD_STATUS', '召回单已结案，不能再退款')
+      if (q > rvRow.sold_qty - rvRow.refund_qty + 0.0001) {
+        throw new RecallError('QTY_EXCEED', `可退数量不足（待退净售出 ${round1(rvRow.sold_qty - rvRow.refund_qty)}）`)
+      }
+      const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(rvRow.vendor_id)
+      const material = getMaterial(r.material_id)
+      if (rvRow.is_partner) {
         // 联营：园方代付游客退款，分账以负向红冲行结转下一账单（不退库、不回补批次成本）
-        const pr = ctx.organicPartnerReturn?.(rv.vendor_id, q, {
+        const pr = ctx.organicPartnerReturn?.(rvRow.vendor_id, q, {
           refund, complaintId: r.complaint_id || null,
           reason: `供应商批次召回 ${r.code} 游客退货（问题品不回库）`
         })
@@ -207,22 +233,75 @@ export function vendorRefund(recallId, vendorId, qty, { note = '', staffId = nul
       }
       // 自营由园方承担退款；联营园方当场代付游客（红冲在结算时向商户收回）——统一现金扣减
       ctx.deductCash?.(refund)
-      ctx.logFinance?.(ctx.day(), '商业', -refund, `召回 ${r.code}「${v?.name}」游客退货退款 ${q} ${material?.unit || '份'}（${rv.is_partner ? '联营红冲' : '自营'}）`)
+      ctx.logFinance?.(ctx.day(), '商业', -refund, `召回 ${r.code}「${v?.name}」游客退货退款 ${q} ${material?.unit || '份'}（${rvRow.is_partner ? '联营红冲' : '自营'}）`)
       // 库存口径留痕：仅记退货数量（正），不回补在库（问题品不回库），供净售出统计冲减
       db.prepare(`INSERT INTO stock_movements(material_id,batch_id,vendor_id,change,qty_after,reason,ref_type,ref_id,day,tick)
                   VALUES(?,NULL,?,?, (SELECT qty_on_hand FROM inventory WHERE material_id=?), 'recall_refund','recall',?,?,?)`)
-        .run(r.material_id, rv.vendor_id, q, r.material_id, r.id, ctx.day(), ctx.tick())
+        .run(r.material_id, rvRow.vendor_id, q, r.material_id, r.id, ctx.day(), ctx.tick())
 
       db.prepare('UPDATE recall_vendors SET refund_qty=refund_qty+?, refund_amount=refund_amount+?, status=? WHERE id=?')
-        .run(q, refund, 'refunded', rv.id)
+        .run(q, refund, 'refunded', rvRow.id)
       db.prepare('UPDATE recall_orders SET refund_qty=refund_qty+?, refund_amount=refund_amount+? WHERE id=?').run(q, refund, r.id)
-      logRecall(r.id, 'refund', `「${v?.name}」为 ${q} ${material?.unit || '份'}问题商品办理游客退货退款 ¥${refund}`, { actor: rv.is_partner ? 'partner' : 'park', vendorId: rv.vendor_id, staffId: num(staffId) || null })
-      return { ok: true, qty: q, refund, partner: !!rv.is_partner }
+      logRecall(r.id, 'refund', `「${v?.name}」为 ${q} ${material?.unit || '份'}问题商品办理游客退货退款 ¥${refund}`, { actor: rvRow.is_partner ? 'partner' : 'park', vendorId: rvRow.vendor_id, staffId: num(staffId) || null })
+      return { ok: true, qty: q, refund, partner: !!rvRow.is_partner }
     })
   } catch (e) {
-    return { ok: false, code: e.code || 'TX_FAILED', msg: e.message || '退货退款失败' }
+    if (e instanceof RecallError) return { ok: false, code: e.code, msg: e.message }
+    return { ok: false, code: 'TX_FAILED', msg: e.message || '退货退款失败' }
   }
 }
+
+// 统一补偿队列挂载：联营/自营召回游客退款失败后独立持久化（含红冲账单同步）
+function enqueuePartnerRecallRefund({ recallId, rvId, vendorId, qty, isPartner, reason }) {
+  enqueueDetached({
+    domain: 'partner',
+    action: 'partner_recall_refund',
+    idemKey: `recall:${recallId}:rv:${rvId}:qty:${qty}`,
+    refType: 'recall_vendor',
+    refId: rvId,
+    priority: 2,
+    source: 'retry',
+    payload: { recallId, recallVendorId: rvId, vendorId, qty, isPartner: !!isPartner },
+    note: `召回游客退货退款失败（${reason}），统一补偿队列重试（现金+红冲账单同步）`
+  })
+}
+
+// ---------------- 统一补偿队列：联营退款处理器（召回游客退货；自营/联营共用） ----------------
+// 同步四个口径：现金（代付游客退款）、库存（退货留痕，不回库）、投诉（关联召回投诉随退款推进）、
+// 账单（联营红冲行 settlement_id=0，自动结转下一张结算账单冲减商户应得）。
+registerHandler('partner', (task) => {
+  if (task.action !== 'partner_recall_refund') throw new Error(`UNSUPPORTED_PARTNER_ACTION:${task.action}`)
+  const { recallId, recallVendorId, qty } = task.payload
+  const rv = db.prepare('SELECT * FROM recall_vendors WHERE id=?').get(num(recallVendorId))
+  if (!rv) return { obsolete: true, note: '召回商铺记录不存在' }
+  const v = db.prepare('SELECT * FROM vendors WHERE id=?').get(rv.vendor_id)
+  const refund = Math.round(num(qty) * (v?.price || 0))
+  // 幂等防线：退款事务以“sold_qty-refund_qty 仍够本任务数量”为条件；
+  // 若人工/他途已退导致可退数量不足本任务数量，说明本任务对应商品已被处置，任务作废，不补退差额、不重复红冲。
+  const remainSold = Math.round(((rv.sold_qty - rv.refund_qty) + Number.EPSILON) * 100) / 100
+  if (remainSold + 0.0001 < num(qty)) {
+    return { obsolete: true, note: `该铺待退净售出仅 ${remainSold} 份（人工或他途已退款 ${rv.refund_qty} 份），补偿作废，不重复退款/红冲` }
+  }
+  const res = applyVendorRefundTx({ recallId: num(recallId), rv, q: num(qty), refund })
+  if (!res.ok) {
+    if (res.code === 'QTY_EXCEED' || res.code === 'BAD_STATUS') {
+      return { obsolete: true, note: res.msg }
+    }
+    throw new Error(`${res.code} ${res.msg}`)   // 触发队列退避重试
+  }
+  // 账单口径：联营红冲行已写入（settlement_id=0），下张结算单自动净额冲减
+  const billNote = res.partner
+    ? '联营红冲已入账，结转下张结算账单冲减商户应得与分成'
+    : '自营退款现金已扣减（无联营账单）'
+  return {
+    ok: true,
+    qty: res.qty,
+    cash: res.refund,
+    stock: `召回退货留痕 ${res.qty} 份（问题品不回库）`,
+    complaint: '关联召回投诉随退款推进，结案时统一闭环',
+    bill: billNote
+  }
+})
 
 // ---------------- 隔离批次退回供应商 ----------------
 export function returnBatches(id, qty, { staffId = null } = {}) {

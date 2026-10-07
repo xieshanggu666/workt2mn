@@ -7,7 +7,7 @@
     "dev": "concurrently -k -n SERVER,WEB -c blue,green \"node --experimental-sqlite server/index.js\" \"vite\"",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-sqlite --test server/reservations.test.js server/maintenance.test.js server/members.test.js server/scheduling.test.js server/dispatch_plan.test.js server/groups.test.js server/flow.test.js server/rides.test.js server/emergency.test.js server/procurement.test.js server/partners.test.js server/gifts.test.js server/recalls.test.js"
+    "test": "node --experimental-sqlite --test server/reservations.test.js server/maintenance.test.js server/members.test.js server/scheduling.test.js server/dispatch_plan.test.js server/groups.test.js server/flow.test.js server/rides.test.js server/emergency.test.js server/procurement.test.js server/partners.test.js server/gifts.test.js server/recalls.test.js server/compensation.test.js"
   },
   "dependencies": {
     "express": "^4.19.2",

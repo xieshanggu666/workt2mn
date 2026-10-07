@@ -95,7 +95,13 @@ function closeDetail() { detail.value = null }
 
 async function act(fn, ...args) {
   const r = await fn(...args)
-  if (!r?.ok) { alert(r?.msg || '操作失败'); return }
+  if (!r?.ok) {
+    // 退款进入统一补偿队列（事务失败自动重试）：告知用户已挂起，可在「停运补偿」页跟踪
+    if (r.queued || r.code === 'QUEUED_COMPENSATION') { alert(r.msg || '已进入停运补偿队列，系统将自动重试完成退款/红冲') }
+    else alert(r?.msg || '操作失败')
+    if (detail.value) await openDetail({ id: detail.value.recall.id })
+    return
+  }
   if (detail.value) await openDetail({ id: detail.value.recall.id })
 }
 const doAccept = () => act(store.acceptRecall.bind(store), detail.value.recall.id, null)

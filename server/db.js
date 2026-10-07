@@ -1339,6 +1339,72 @@ CREATE INDEX IF NOT EXISTS idx_gift_items_gift ON member_gift_items(gift_id,seq)
 CREATE INDEX IF NOT EXISTS idx_gift_items_benefit ON member_gift_items(benefit_id);
 CREATE INDEX IF NOT EXISTS idx_gift_items_gifted ON member_gift_items(gifted_benefit_id);
 
+-- ========================================================================
+-- 统一可恢复补偿队列（设施停运补偿）：
+--   设施停运/全园封控后，散客预约退款、团队行程（重排/挂起/退团款）、联营退款
+--   三类补偿统一登记为补偿任务。停运主流程（改状态/关时段）即时生效，
+--   补偿逐任务在独立事务内执行：现金/库存/投诉/账单同事务，任一失败整体回滚，
+--   任务保持 pending 由引擎每小时重试，直到成功或人工介入。
+--   处理器必须幂等：重试/人工已处理后不会重复扣款或重复退款。
+--   idem_key 为业务幂等键（同一预约/行程/退款单至多一条未终结任务）；
+--   终结后（done/manual/obsolete）允许同键重新挂起（部分唯一索引）。
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS compensation_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',             -- BC0001
+  domain TEXT NOT NULL,                      -- reservation 散客预约 / group 团队行程 / partner 联营退款
+  action TEXT NOT NULL DEFAULT '',          -- outage_refund / overbook_refund / group_outage / partner_recall_refund ...
+  idem_key TEXT NOT NULL,                    -- 业务幂等键（如 rsv:123 / item:45 / recall:3:vendor:7:qty:2）
+  ref_type TEXT NOT NULL DEFAULT '',         -- reservation/group_item/partner_sale/recall_vendor ...
+  ref_id INTEGER,
+  payload TEXT NOT NULL DEFAULT '{}',        -- 执行所需快照（退款原因/金额/停运信息/投诉载荷/账单同步信息）
+  status TEXT NOT NULL DEFAULT 'pending',    -- pending 待重试 / processing 执行中 / done 已补偿 / manual 人工已处理 / obsolete 业务已消失
+  source TEXT NOT NULL DEFAULT 'auto',       -- auto 停运联动 / manual 人工挂起 / retry 重试转入
+  priority INTEGER NOT NULL DEFAULT 5,       -- 1 最高（全园封控现金退款优先）
+  attempts INTEGER NOT NULL DEFAULT 0,       -- 已尝试次数
+  max_attempts INTEGER NOT NULL DEFAULT 20,  -- 超过后转 needs_manual 等待人工
+  needs_manual INTEGER NOT NULL DEFAULT 0,   -- 1 多次失败，挂人工队列
+  last_error TEXT NOT NULL DEFAULT '',       -- 最近一次失败错误码与信息
+  result TEXT NOT NULL DEFAULT '{}',         -- 成功结果快照（金额/库存/投诉/账单联动结果，JSON）
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER,                          -- 人工处理经办
+  created_tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  updated_tick INTEGER NOT NULL DEFAULT 0,
+  finished_tick INTEGER NOT NULL DEFAULT 0,
+  finished_day INTEGER NOT NULL DEFAULT 0,
+  next_run_tick INTEGER NOT NULL DEFAULT 0   -- 退避：最早下次重试时刻
+);
+-- 同一业务幂等键同时只允许一条未终结任务（重复停运联动/双击重放不重复挂起）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_comp_one ON compensation_tasks(idem_key) WHERE status IN ('pending','processing');
+CREATE INDEX IF NOT EXISTS idx_comp_status ON compensation_tasks(status,needs_manual,priority,id);
+CREATE INDEX IF NOT EXISTS idx_comp_domain ON compensation_tasks(domain,status);
+CREATE INDEX IF NOT EXISTS idx_comp_ref ON compensation_tasks(ref_type,ref_id);
+
+-- 补偿任务执行时间线：登记/重试/成功/作废/人工处理/转人工，逐次留痕可审计；
+-- 在任务事务内写入（失败随事务回滚则该次尝试不留成功痕迹，错误信息也单独更新任务行）
+CREATE TABLE IF NOT EXISTS compensation_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,                      -- enqueue/retry/success/obsolete/manual/needs_manual
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_comp_logs_task ON compensation_logs(task_id);
+
+-- 停运批次投诉幂等去重：同一次停运/封控批次（batchKey，如 ride:1:305）的多笔补偿
+-- 只允许生成一张投诉工单；跨任务、跨重试、跨重启均生效（INSERT OR IGNORE 幂等）。
+CREATE TABLE IF NOT EXISTS compensation_complaint_batches (
+  batch_key TEXT PRIMARY KEY,           -- 业务批次键（ride:<id>:<tick> / slot:<id>:<tick> / entry:<tick>）
+  complaint_id INTEGER NOT NULL,
+  domain TEXT NOT NULL DEFAULT 'reservation',
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0
+);
+
 -- 转赠全生命周期时间线（申请/撤回申请/审核通过/驳回/自动审核/领取/拒绝/运营撤回/捐赠人撤回/过期回补/预约联动）
 CREATE TABLE IF NOT EXISTS member_gift_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

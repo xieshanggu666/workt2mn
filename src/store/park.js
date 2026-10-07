@@ -169,7 +169,10 @@ export const useParkStore = defineStore('park', {
     // 供应商批次召回
     recalls: s => s.data?.recalls || [],
     recallStats: s => s.data?.recallStats || emptyRecallStats(),
-    openRecalls: s => (s.data?.recalls || []).filter(r => ['issued', 'processing'].includes(r.status))
+    openRecalls: s => (s.data?.recalls || []).filter(r => ['issued', 'processing'].includes(r.status)),
+    // 统一可恢复补偿队列（停运预约退款 / 团队行程 / 联营退款）
+    compensations: s => s.data?.compensations || [],
+    compensationStats: s => s.data?.compensationStats || { pending: 0, totalAttempts: 0, needsManual: 0, doneToday: 0, pendingByDomain: {} }
   },
   actions: {
     async refresh() {
@@ -356,6 +359,11 @@ export const useParkStore = defineStore('park', {
     closeRecall(id, note) { return this.api('POST', `/recalls/${id}/close`, { note }) },
     closeFalseRecall(id, reason) { return this.api('POST', `/recalls/${id}/false`, { reason }) },
     cancelRecall(id, reason) { return this.api('POST', `/recalls/${id}/cancel`, { reason }) },
-    async recallDetail(id) { return j('GET', `/recalls/${id}`) }
+    async recallDetail(id) { return j('GET', `/recalls/${id}`) },
+    // 统一可恢复补偿队列：立即重试 / 登记人工已处理 / 人工核对作废
+    retryCompensation(id, note) { return this.api('POST', `/compensations/${id}/retry`, { note }) },
+    resolveCompensationManual(id, note) { return this.api('POST', `/compensations/${id}/manual`, { note }) },
+    obsoleteCompensation(id, note) { return this.api('POST', `/compensations/${id}/obsolete`, { note }) },
+    async compensationDetail(id) { return j('GET', `/compensations/${id}`) }
   }
 })
